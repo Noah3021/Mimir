@@ -1,0 +1,102 @@
+# ==================== Mimir 配置 ====================
+# 字符串中可用 ${ENV_VAR} 或 ${ENV_VAR:默认值} 引用环境变量（来自 .env）
+# 相对路径均相对于本配置文件所在目录
+
+agent:
+  name: Mimir
+  default_model: deepseek      # 启动时使用的模型（models 下的键名），可用 -m 覆盖
+  recursion_limit: 50          # 单轮对话内 LLM <-> 工具 的最大循环步数
+  max_history_messages: 60     # 发送给模型的最大历史消息数，超出后从最早的对话开始裁剪
+  # 可用占位符：{agent_name} {now} {weekday} {os} {workspace} {model} {tools}
+  system_prompt: |
+    你是 {agent_name}，用户的个人 AI 助手，运行在命令行终端中。
+    （名字取自北欧神话中守护智慧之泉的智者 Mímir。）
+
+    ## 行为准则
+    - 使用简体中文回答，简洁、准确；不确定时如实说明，不要编造。
+    - 需要获取信息或操作文件时优先调用工具，不要臆测文件内容。
+    - 修改文件前先读取确认；执行有副作用的命令前简要说明意图。
+    - 文件与命令操作仅限工作目录内。
+    - 回答可使用 Markdown 格式。
+
+    ## 运行环境
+    - 当前时间：{now}（{weekday}）
+    - 操作系统：{os}
+    - 工作目录：{workspace}
+    - 当前模型：{model}
+    - 可用工具：{tools}
+
+# 模型定义，CLI 中用 /model <名称> 切换，/think <级别> 调整推理强度
+#   provider : openai（GPT）| deepseek | anthropic（Claude）
+#   reasoning: off | low | medium | high | xhigh
+# 其余未列出的字段会原样透传给对应的 LangChain 模型类（如 use_responses_api、extra_body）
+models:
+  deepseek:
+    provider: deepseek
+    description: DeepSeek（阿里云百炼 OpenAI 兼容接口）
+    base_url: ${BASE_URL}
+    api_key: ${API_KEY}
+    model: ${MODEL_ID}
+    reasoning: ${REASONING_DEEPSEEK:high}   # DeepSeek 只区分开/关：off 关闭，其余级别均为开启
+    thinking_param: enable_thinking         # 百炼填 enable_thinking；DeepSeek 官方接口填 thinking
+    temperature: 0.7                        # 仅在关闭推理时生效
+    timeout: ${TIMEOUT:180}
+    max_retries: ${MAX_RETRIES:2}
+
+  gpt:
+    provider: openai
+    description: GPT（Responses API）
+    base_url: ${BASE_URL_GPT}
+    api_key: ${API_KEY_GPT}
+    model: ${MODEL_ID_GPT}
+    use_responses_api: true
+    reasoning: ${REASONING_EFFORT:high}     # 直接作为 reasoning.effort 传给接口
+    reasoning_summary: auto                 # 返回推理摘要，CLI 中显示为“思考过程”
+    timeout: ${TIMEOUT:180}
+    max_retries: ${MAX_RETRIES:2}
+
+  claude:
+    provider: anthropic
+    description: Claude（Anthropic Messages API）
+    base_url: ${BASE_URL_CLAUDE}            # 留空使用官方地址；中转地址不要带 /v1
+    api_key: ${API_KEY_CLAUDE}
+    model: ${MODEL_ID_CLAUDE}
+    reasoning: ${REASONING_CLAUDE:high}     # 思考预算：low 2k / medium 8k / high 16k / xhigh 32k
+    max_tokens: 8192                        # 正文最大输出，不含思考预算
+    timeout: ${TIMEOUT:180}
+    max_retries: ${MAX_RETRIES:2}
+
+tools:
+  workspace: null              # 文件/Shell 工具的根目录；null = 启动时所在目录（可用 -w 覆盖）
+  disabled: []                 # 禁用的工具名，例如 [run_shell]
+  require_approval:            # 执行前需要你确认的工具
+    - write_file
+    - edit_file
+    - run_shell
+  max_output_chars: 8000       # 单次工具输出的最大字符数
+  shell:
+    enabled: true
+    executable: null           # null = 系统默认 shell（Windows 为 cmd.exe）；也可填 bash / pwsh 的路径
+    timeout: 60                # 命令默认超时（秒）
+    blocked_patterns:          # 命令包含这些片段时直接拒绝
+      - "rm -rf /"
+      - "format c:"
+      - "mkfs"
+      - ":(){"
+
+memory:
+  db_path: data/sessions.db    # 会话（LangGraph checkpointer）与 token 用量统计
+  transcripts:                 # 明文对话记录（JSONL，每个会话一个文件，可直接打开查看）
+    enabled: true
+    dir: data/transcripts      # 实际路径：<dir>/<工作目录名>/<会话ID>.jsonl
+
+cli:
+  stream: true                 # 流式输出
+  show_tool_calls: true        # 显示工具调用过程
+  show_reasoning: true         # 显示推理过程 / 摘要（模型支持时）
+  show_usage: true             # 每轮结束后显示 token 用量
+  history_file: data/input_history.txt
+
+logging:
+  level: INFO
+  file: data/agent.log
