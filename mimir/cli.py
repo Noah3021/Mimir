@@ -303,6 +303,8 @@ class AgentCLI:
                 self.printer.feed("text", text)
             elif mode == "custom" and isinstance(data, dict) and data.get("type") == "retry":
                 self._handle_retry(data)
+            elif mode == "custom" and isinstance(data, dict) and data.get("type") == "compact":
+                self._handle_compact(data)
             elif mode == "updates" and isinstance(data, dict):
                 self._handle_update(data, streaming)
                 self.rt.sync_transcript()  # 每个节点完成后立即追加，时间戳更准确
@@ -316,6 +318,23 @@ class AgentCLI:
             ("  ⟳ ", "yellow"), (f"连接中断，{delay}s 后重试（{attempt}/{total}）", "yellow"),
             " ", (short(str(data.get("error", "")), 100), "dim")))
         self.printer.wait("重新连接中…")
+
+    def _handle_compact(self, data: dict) -> None:
+        """上下文压缩：开始时显示等待动画，结束时提示压缩结果。"""
+        n = data.get("messages")
+        if data.get("stage") == "start":
+            self.printer.wait(f"上下文接近上限，正在摘要较早的 {n} 条消息…")
+            return
+        self.printer.end()
+        if data.get("stage") == "done":
+            self.console.print(Text.assemble(
+                ("  ◇ ", "cyan"), (f"已将较早的 {n} 条消息压缩为摘要", "cyan"),
+                (f"（约 {data.get('before', 0):,} → {data.get('after', 0):,} tokens）", "dim")))
+        else:
+            self.console.print(Text.assemble(
+                ("  ⚠ ", "yellow"), (f"摘要生成失败，已省略较早的 {n} 条消息", "yellow"),
+                " ", (short(str(data.get("error", "")), 100), "dim")))
+        self.printer.wait()
 
     def _handle_update(self, data: dict, streaming: bool) -> None:
         for node, value in data.items():
@@ -637,7 +656,8 @@ class AgentCLI:
             ("对话记录", str(self.rt.transcript.path(self.rt.thread_id)) if s.memory.transcripts_enabled else "已关闭"),
             ("日志文件", str(s.logging.file or "-")),
             ("单轮最大步数", str(s.agent.recursion_limit)),
-            ("历史消息上限", str(s.agent.max_history_messages)),
+            ("上下文窗口", self._context_desc()),
+            ("早期对话摘要", self._summary_desc()),
             ("需确认的工具", ", ".join(sorted(self.rt.approval.required)) or "-"),
             ("禁用的工具", ", ".join(s.tools.disabled) or "-"),
             ("流式输出", "是" if s.cli.stream else "否"),
@@ -645,6 +665,19 @@ class AgentCLI:
         for k, v in rows:
             table.add_row(Text(k, style="dim"), v)
         self.console.print(Panel(table, title="当前配置", border_style="cyan", expand=False))
+
+    def _context_desc(self) -> str:
+        c = self.settings.agent.context
+        window = self.rt.model_config.context_window or c.window
+        clear = f"清理 {c.clear_keep_turns} 轮前的工具输出，" if c.clear_keep_turns else ""
+        return f"{window:,} tokens（{c.high:.0%} 触发压缩 → {c.low:.0%}，{clear}较早对话压缩为摘要）"
+
+    def _summary_desc(self) -> str:
+        try:
+            summary, cut = self.rt.context_info()
+        except Exception:
+            return "-"
+        return f"已将较早的 {cut} 条消息压缩为摘要（约 {len(summary):,} 字）" if cut else "无"
 
     def cmd_clear(self, _: str) -> None:
         self.console.clear()

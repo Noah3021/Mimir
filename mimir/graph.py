@@ -1,7 +1,13 @@
-"""LangGraph 工作流：START -> agent(LLM) -> [有工具调用] -> tools -> agent ... -> END
+"""LangGraph 工作流：
+
+    START -> [需要压缩] -> compact -> agent(LLM) -> [有工具调用] -> tools -> [需要压缩] -> compact -> agent ... -> END
 
 tools 节点在执行需要确认的工具前调用 interrupt() 暂停，由 CLI 询问用户后用
 Command(resume=...) 恢复。审批放在执行之前统一进行，保证恢复重放节点时不会重复产生副作用。
+
+compact 节点只在历史超过高水位时进入：清理旧工具输出，仍超出时把最早的若干轮对话交给模型
+生成摘要。压缩状态（summary / summary_cut / clear_before）写入图状态，随 Checkpointer 持久化；
+agent 节点只按状态拼装请求，两次压缩之间发送内容的前缀保持不变，便于命中提示词缓存。
 """
 from __future__ import annotations
 
@@ -11,9 +17,10 @@ import time
 from typing import Any, Callable, Sequence
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage, trim_messages
-from langchain_core.runnables import RunnableConfig
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import BaseTool
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, MessagesState, StateGraph
@@ -25,8 +32,18 @@ except ImportError:  # 旧版 langgraph
     get_stream_writer = None
 
 from .approval import ApprovalPolicy
+from .config import ContextConfig
+from .context import ContextPlan, estimate_message_tokens, estimate_text_tokens, history_budget, plan_context
+from .summary import build_summary_request, split_chunks, summary_block
+from .tool_clearing import clear_boundary, clear_old_tool_outputs
 
 logger = logging.getLogger(__name__)
+
+
+class AgentState(MessagesState):
+    summary: str        # 早期对话摘要（拼接在系统提示词后面）
+    summary_cut: int    # messages[:summary_cut] 已由摘要代替，不再发送
+    clear_before: int   # messages[:clear_before] 中的大段工具输出发送时替换为占位文字
 
 
 def message_text(msg: BaseMessage) -> str:
@@ -86,7 +103,7 @@ def is_transient_error(exc: BaseException) -> bool:
 
 
 def _stream_writer() -> Callable[[Any], None]:
-    """获取 LangGraph 自定义流写入器，用于通知 CLI 重试；不可用时返回空函数。"""
+    """获取 LangGraph 自定义流写入器，用于通知 CLI 重试 / 压缩；不可用时返回空函数。"""
     if get_stream_writer is None:
         return lambda _: None
     try:
@@ -114,20 +131,18 @@ def _normalize_decision(decision: Any) -> tuple[bool, str]:
     return False, ""
 
 
-def _prepare_history(messages: Sequence[BaseMessage], max_messages: int, profile: str) -> list[BaseMessage]:
-    msgs = list(messages)
-    if max_messages and len(msgs) > max_messages:
-        trimmed = trim_messages(
-            msgs, max_tokens=max_messages, token_counter=len, strategy="last",
-            start_on="human", include_system=False, allow_partial=False,
-        )
-        if not trimmed:  # 单轮工具调用过多时，至少保留最近一条用户消息起的内容
-            last_human = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)), default=0)
-            trimmed = msgs[last_human:]
-        msgs = list(trimmed)
+def _tools_overhead(tools: Sequence[BaseTool]) -> int:
+    """估算工具定义（JSON Schema）占用的 token。"""
+    try:
+        schemas = [convert_to_openai_tool(t) for t in tools]
+    except Exception:  # 估算失败不影响对话
+        schemas = [{"name": t.name, "description": t.description} for t in tools]
+    return estimate_text_tokens(json.dumps(schemas, ensure_ascii=False, default=str))
 
+
+def _adapt_for_profile(messages: Sequence[BaseMessage], profile: str) -> list[BaseMessage]:
     result = []
-    for m in msgs:
+    for m in messages:
         # 切换模型后，把其他模型产生的消息简化为纯文本，避免不同接口格式（如推理块）不兼容
         if isinstance(m, AIMessage):
             origin = m.response_metadata.get("agent_profile")
@@ -137,6 +152,11 @@ def _prepare_history(messages: Sequence[BaseMessage], max_messages: int, profile
     return result
 
 
+def context_state(state: dict) -> tuple[str, int, int]:
+    """读取压缩状态 (summary, summary_cut, clear_before)；旧会话没有这些字段时取默认值。"""
+    return (state.get("summary") or "", int(state.get("summary_cut") or 0), int(state.get("clear_before") or 0))
+
+
 def build_agent_graph(
     *,
     llm: BaseChatModel,
@@ -144,23 +164,28 @@ def build_agent_graph(
     system_prompt: Callable[[], str],
     approval: ApprovalPolicy,
     checkpointer: BaseCheckpointSaver | None,
-    max_history_messages: int = 60,
+    context: ContextConfig | None = None,
+    context_window: int | None = None,
     profile: str = "default",
     max_tool_output_chars: int = 8000,
     max_stream_retries: int = 5,
+    on_usage: Callable[[AIMessage], None] | None = None,
 ):
     tools_by_name = {t.name: t for t in tools}
     model = llm.bind_tools(list(tools)) if tools else llm
+    ctx = context or ContextConfig()
+    window = context_window or ctx.window
+    tools_tokens = _tools_overhead(tools)
+    clearing = ctx.clear_keep_turns > 0
+    # 新摘要的预估 token（摘要按 summary_chars 字控制长度，按最坏情况 1 字 1 token 计）
+    summary_reserve = estimate_text_tokens(summary_block("中" * ctx.summary_chars))
 
-    def agent_node(state: MessagesState, config: RunnableConfig):
-        history = _prepare_history(state["messages"], max_history_messages, profile)
-        messages = [SystemMessage(system_prompt()), *history]
+    def invoke_with_retry(runnable: Runnable, messages: list[BaseMessage], config: RunnableConfig) -> AIMessage:
         writer = _stream_writer()
         attempt = 0
         while True:
             try:
-                response = model.invoke(messages, config)
-                break
+                return runnable.invoke(messages, config)
             except GraphBubbleUp:
                 raise
             except Exception as e:
@@ -175,10 +200,82 @@ def build_agent_graph(
                 writer({"type": "retry", "attempt": attempt, "max": max_stream_retries,
                         "delay": delay, "error": f"{type(e).__name__}: {e}"})
                 time.sleep(delay)
+
+    def plan(state: AgentState) -> tuple[ContextPlan, int, int]:
+        msgs = state["messages"]
+        summary, cut, cb = context_state(state)
+        overhead = estimate_text_tokens(system_prompt()) + tools_tokens
+        high, low = history_budget(window, ctx.high, ctx.low, reserve=ctx.output_reserve, overhead=overhead)
+        p = plan_context(
+            msgs, high=high, low=low, cut=cut, clear_before=cb,
+            summary_tokens=estimate_text_tokens(summary_block(summary)), summary_reserve=summary_reserve,
+            cleared_cost=(lambda m: estimate_message_tokens(
+                clear_old_tool_outputs([m], 1, min_chars=ctx.clear_min_chars)[0])) if clearing else None,
+            clear_boundary=(lambda end: clear_boundary(msgs[:end], ctx.clear_keep_turns)) if clearing else None,
+        )
+        return p, high, low
+
+    def route_in(state: AgentState) -> str:
+        """进入 agent 前判断是否需要压缩（只在越过高水位时为真）。"""
+        p, _, _ = plan(state)
+        _, cut, cb = context_state(state)
+        return "compact" if (p.cut, p.clear_before) != (cut, cb) else "agent"
+
+    def summarize(previous: str, msgs: Sequence[BaseMessage], chunk_budget: int, config: RunnableConfig) -> str:
+        summary = previous
+        for chunk in split_chunks(msgs, chunk_budget):
+            resp = invoke_with_retry(llm, build_summary_request(summary, chunk, ctx.summary_chars), config)
+            resp.response_metadata["agent_profile"] = profile
+            if on_usage is not None:
+                on_usage(resp)
+            text = message_text(resp).strip()
+            if not text:
+                raise RuntimeError("模型返回了空摘要")
+            summary = text
+        return summary
+
+    def compact_node(state: AgentState, config: RunnableConfig):
+        p, high, low = plan(state)
+        summary, cut, cb = context_state(state)
+        update: dict[str, Any] = {"clear_before": p.clear_before}
+        if p.cut <= cut:
+            logger.info("上下文压缩：清理第 %d 条之前的旧工具输出，约 %d → %d tokens（高水位 %d / 低水位 %d，窗口 %d）",
+                        p.clear_before, p.before, p.tokens, high, low, window)
+            return update
+
+        writer = _stream_writer()
+        n = p.cut - cut
+        writer({"type": "compact", "stage": "start", "messages": n})
+        chunk_budget = max(2000, low - summary_reserve)
+        try:
+            new_summary, ok, error = summarize(summary, state["messages"][cut:p.cut], chunk_budget, config), True, ""
+        except GraphBubbleUp:
+            raise
+        except Exception as e:  # 摘要失败时退化为直接省略，避免请求超出上下文窗口
+            logger.exception("生成对话摘要失败")
+            note = f"（另有 {n} 条更早的消息因摘要生成失败而被省略。）"
+            new_summary, ok, error = f"{summary}\n\n{note}".strip(), False, f"{type(e).__name__}: {e}"
+        after = estimate_text_tokens(summary_block(new_summary)) + p.tokens - summary_reserve
+        logger.info("上下文压缩：%s前 %d 条消息（第 %d~%d 条），清理第 %d 条之前的旧工具输出，约 %d → %d tokens"
+                    "（高水位 %d / 低水位 %d，窗口 %d）", "摘要" if ok else "省略", p.cut, cut, p.cut - 1,
+                    p.clear_before, p.before, after, high, low, window)
+        writer({"type": "compact", "stage": "done" if ok else "failed", "messages": n,
+                "before": p.before, "after": after, "error": error})
+        update.update(summary=new_summary, summary_cut=p.cut)
+        return update
+
+    def agent_node(state: AgentState, config: RunnableConfig):
+        summary, cut, cb = context_state(state)
+        msgs = state["messages"]
+        if cb:
+            msgs = clear_old_tool_outputs(msgs, cb, min_chars=ctx.clear_min_chars)
+        history = _adapt_for_profile(list(msgs)[cut:], profile)
+        messages = [SystemMessage(system_prompt() + summary_block(summary)), *history]
+        response = invoke_with_retry(model, messages, config)
         response.response_metadata["agent_profile"] = profile
         return {"messages": [response]}
 
-    def tools_node(state: MessagesState):
+    def tools_node(state: AgentState):
         last = state["messages"][-1]
         calls = getattr(last, "tool_calls", None) or []
 
@@ -215,14 +312,16 @@ def build_agent_graph(
             results.append(ToolMessage(output, tool_call_id=call_id, name=name, status=status))
         return {"messages": results}
 
-    def route(state: MessagesState) -> str:
+    def route(state: AgentState) -> str:
         last = state["messages"][-1]
         return "tools" if isinstance(last, AIMessage) and last.tool_calls else END
 
-    graph = StateGraph(MessagesState)
+    graph = StateGraph(AgentState)
+    graph.add_node("compact", compact_node)
     graph.add_node("agent", agent_node)
     graph.add_node("tools", tools_node)
-    graph.add_edge(START, "agent")
+    graph.add_conditional_edges(START, route_in, ["compact", "agent"])
+    graph.add_edge("compact", "agent")
     graph.add_conditional_edges("agent", route, ["tools", END])
-    graph.add_edge("tools", "agent")
+    graph.add_conditional_edges("tools", route_in, ["compact", "agent"])
     return graph.compile(checkpointer=checkpointer)

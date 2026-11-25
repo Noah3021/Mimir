@@ -18,7 +18,7 @@ _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-?([^}]*))?\}")
 _SCALAR_PATTERN = re.compile(r"^(?:-?\d+(?:\.\d+)?|true|false|True|False)$")
 
 _MODEL_KNOWN_KEYS = {"base_url", "api_key", "model", "temperature", "timeout", "max_retries", "description",
-                     "provider", "reasoning", "max_tokens"}
+                     "provider", "reasoning", "max_tokens", "context_window"}
 
 PROVIDERS = ("openai", "deepseek", "anthropic")
 REASONING_LEVELS = ("off", "low", "medium", "high", "xhigh")
@@ -60,6 +60,7 @@ class ModelConfig:
     provider: str = "openai"         # openai | deepseek | anthropic
     reasoning: str = "off"           # off | low | medium | high | xhigh
     max_tokens: int | None = None    # 最大输出 token（anthropic 不含思考预算）
+    context_window: int | None = None  # 上下文窗口 token 数；None = 使用 agent.context.window
     extra: dict[str, Any] = field(default_factory=dict)  # 透传给模型类的其他参数
 
     def missing_fields(self) -> list[str]:
@@ -76,13 +77,24 @@ class ModelConfig:
 
 
 @dataclass
+class ContextConfig:
+    window: int = 128_000            # 默认上下文窗口（token），模型可用 context_window 覆盖
+    high: float = 0.8                # 高水位：历史超过窗口的该比例时触发压缩
+    low: float = 0.5                 # 低水位：压缩后的目标比例
+    output_reserve: int = 16_000     # 为模型输出（含思考）预留的 token
+    clear_keep_turns: int = 3        # 清理旧工具输出时，最近几轮不动；0 = 不清理
+    clear_min_chars: int = 500       # 只清理超过该字符数的工具输出
+    summary_chars: int = 2000        # 早期对话摘要的目标长度（字）
+
+
+@dataclass
 class AgentConfig:
     name: str
     system_prompt: str
     default_model: str
     recursion_limit: int = 50
-    max_history_messages: int = 60
     stream_retries: int = 5          # 连接中断时自动重发请求的最大次数
+    context: ContextConfig = field(default_factory=ContextConfig)
 
 
 @dataclass
@@ -180,6 +192,7 @@ def _parse_model(name: str, raw: Any) -> ModelConfig:
         provider=provider,
         reasoning=normalize_reasoning(raw.get("reasoning"), f"models.{name}.reasoning"),
         max_tokens=_to_number(raw.get("max_tokens"), int, None, f"models.{name}.max_tokens"),
+        context_window=_to_number(raw.get("context_window"), int, None, f"models.{name}.context_window"),
         model=str(raw.get("model") or "").strip(),
         base_url=(str(raw.get("base_url")).strip() or None) if raw.get("base_url") else None,
         api_key=(str(raw.get("api_key")).strip() or None) if raw.get("api_key") else None,
@@ -189,6 +202,29 @@ def _parse_model(name: str, raw: Any) -> ModelConfig:
         description=str(raw.get("description") or ""),
         extra={k: v for k, v in raw.items() if k not in _MODEL_KNOWN_KEYS},
     )
+
+
+def _parse_context(raw: Any) -> ContextConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError("agent.context 必须是键值对")
+    d = ContextConfig()
+    ctx = ContextConfig(
+        window=_to_number(raw.get("window"), int, d.window, "agent.context.window"),
+        high=_to_number(raw.get("high"), float, d.high, "agent.context.high"),
+        low=_to_number(raw.get("low"), float, d.low, "agent.context.low"),
+        output_reserve=_to_number(raw.get("output_reserve"), int, d.output_reserve, "agent.context.output_reserve"),
+        clear_keep_turns=max(0, _to_number(raw.get("clear_keep_turns"), int, d.clear_keep_turns,
+                                           "agent.context.clear_keep_turns")),
+        clear_min_chars=max(0, _to_number(raw.get("clear_min_chars"), int, d.clear_min_chars,
+                                          "agent.context.clear_min_chars")),
+        summary_chars=max(200, _to_number(raw.get("summary_chars"), int, d.summary_chars,
+                                          "agent.context.summary_chars")),
+    )
+    if ctx.window <= 0:
+        raise ConfigError("agent.context.window 必须大于 0")
+    if not 0 < ctx.low < ctx.high <= 1:
+        raise ConfigError(f"agent.context 需满足 0 < low < high <= 1（当前 low={ctx.low}, high={ctx.high}）")
+    return ctx
 
 
 def load_settings(config_path: str | Path | None = None, *, workspace: str | Path | None = None) -> Settings:
@@ -224,8 +260,8 @@ def load_settings(config_path: str | Path | None = None, *, workspace: str | Pat
         system_prompt=str(a.get("system_prompt") or "你是一个乐于助人的 AI 助手。"),
         default_model=default_model,
         recursion_limit=_to_number(a.get("recursion_limit"), int, 50, "agent.recursion_limit"),
-        max_history_messages=_to_number(a.get("max_history_messages"), int, 60, "agent.max_history_messages"),
         stream_retries=max(0, _to_number(a.get("stream_retries"), int, 5, "agent.stream_retries")),
+        context=_parse_context(a.get("context") or {}),
     )
 
     # ---- tools ----

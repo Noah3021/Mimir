@@ -6,8 +6,17 @@ agent:
   name: Mimir
   default_model: deepseek      # 启动时使用的模型（models 下的键名），可用 -m 覆盖
   recursion_limit: 50          # 单轮对话内 LLM <-> 工具 的最大循环步数
-  max_history_messages: 60     # 发送给模型的最大历史消息数，超出后从最早的对话开始裁剪
   stream_retries: 5            # 连接中断（如流式传输中途断开）时自动重发请求的最大次数，0 = 不重试
+  # 上下文窗口管理（按估算 token）：历史超过高水位时，先清理旧工具输出，仍超出再把最早的几轮对话
+  # 交给模型生成摘要，压缩到低水位。压缩点只在越过高水位时前移，其余时间发送内容的前缀保持不变，便于命中提示词缓存。
+  context:
+    window: 128000             # 默认上下文窗口；单个模型可用 models.<名称>.context_window 覆盖
+    high: 0.8                  # 高水位（窗口占比）
+    low: 0.5                   # 低水位（压缩后的目标占比）
+    output_reserve: 16000      # 为模型输出（含思考）预留的 token
+    clear_keep_turns: 3        # 最近几轮的工具输出不清理；0 = 关闭工具输出清理
+    clear_min_chars: 500       # 只清理超过该字符数的工具输出
+    summary_chars: 2000        # 早期对话摘要的目标长度（字）
   # 可用占位符：{agent_name} {date} {weekday} {os} {workspace} {model} {tools}
   # 系统提示词每个会话只渲染一次并保持不变（便于命中提示词缓存），因此不提供精确到秒的时间
   system_prompt: |

@@ -40,6 +40,7 @@ class AgentRuntime:
         self._reasoning_override: dict[str, str] = {}
         self._turn_start = 0
         self._turn_started_at: str | None = None
+        self._extra_calls: list[AIMessage] = []  # 本轮不在消息历史里的模型调用（如上下文摘要）
         # 系统提示词缓存：键为 (会话 ID, 模型名)。同一会话内保持逐字不变，以命中提示词缓存
         self._prompt_cache: tuple[tuple[str, str], str] | None = None
         self.thread_id = SessionStore.new_session_id()
@@ -74,10 +75,12 @@ class AgentRuntime:
             system_prompt=lambda: self._system_prompt(mc),
             approval=self.approval,
             checkpointer=self.store.checkpointer,
-            max_history_messages=self.settings.agent.max_history_messages,
+            context=self.settings.agent.context,
+            context_window=mc.context_window,
             profile=name,
             max_tool_output_chars=self.settings.tools.max_output_chars,
             max_stream_retries=self.settings.agent.stream_retries,
+            on_usage=self._extra_calls.append,  # 摘要请求不进入消息历史，单独记录用量
         )
         self.model_name = name
         logger.info("使用模型 %s (%s)，推理强度 %s", name, mc.model, self.reasoning_for(name))
@@ -160,6 +163,7 @@ class AgentRuntime:
     def begin_turn(self) -> None:
         """记录本轮开始时的消息数与时间，供明文记录和用量统计区分本轮消息。"""
         self._turn_started_at = now_iso()
+        self._extra_calls.clear()
         try:
             self._turn_start = len(self.messages())
         except Exception:
@@ -168,9 +172,15 @@ class AgentRuntime:
 
     def finish_turn(self) -> Usage:
         """把本轮新产生的模型调用用量写入数据库，并返回本轮用量。"""
-        msgs = self.messages()[self._turn_start:]
+        msgs = self.messages()[self._turn_start:] + self._extra_calls
+        self._extra_calls.clear()  # 不能重新赋值：图里绑定的是这个列表的 append
         self.usage.record(self.thread_id, msgs, profile=self.model_name, model_id=self.model_config.model)
         return summarize(msgs)
+
+    def context_info(self) -> tuple[str, int]:
+        """当前会话的 (早期对话摘要, 已被摘要代替的消息数)。"""
+        values = self.state().values or {}
+        return values.get("summary") or "", int(values.get("summary_cut") or 0)
 
     def session_usage(self) -> Usage:
         return summarize(self.messages())
