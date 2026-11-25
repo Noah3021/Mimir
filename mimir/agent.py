@@ -40,6 +40,8 @@ class AgentRuntime:
         self._reasoning_override: dict[str, str] = {}
         self._turn_start = 0
         self._turn_started_at: str | None = None
+        # 系统提示词缓存：键为 (会话 ID, 模型名)。同一会话内保持逐字不变，以命中提示词缓存
+        self._prompt_cache: tuple[tuple[str, str], str] | None = None
         self.thread_id = SessionStore.new_session_id()
         self.model_name = ""
         self.graph = None
@@ -94,13 +96,23 @@ class AgentRuntime:
             raise
 
     def _system_prompt(self, mc: ModelConfig) -> str:
-        return render_system_prompt(
+        """每个会话（及模型）只渲染一次。
+
+        图中每一步 LLM 调用都会取系统提示词；若每次重新渲染，任何变化都会让后续历史
+        全部无法命中缓存。新建 / 恢复会话（thread_id 变化）或切换模型时才重新渲染。
+        """
+        key = (self.thread_id, mc.name)
+        if self._prompt_cache and self._prompt_cache[0] == key:
+            return self._prompt_cache[1]
+        text = render_system_prompt(
             self.settings.agent.system_prompt,
             agent_name=self.settings.agent.name,
             workspace=self.settings.tools.workspace,
             model=f"{mc.name}（{mc.model}）",
             tools=[t.name for t in self.tools],
         )
+        self._prompt_cache = (key, text)
+        return text
 
     # ---------- 会话 ----------
     def run_config(self) -> dict:

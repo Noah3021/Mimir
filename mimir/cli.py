@@ -542,7 +542,8 @@ class AgentCLI:
 
     @staticmethod
     def _usage_cells(u: Usage) -> list[str]:
-        return [str(u.calls), fmt_tokens(u.input), fmt_tokens(u.cache_read), fmt_tokens(u.output),
+        cache = f"{fmt_tokens(u.cache_read)}（{u.cache_rate:.0%}）" if u.input else fmt_tokens(u.cache_read)
+        return [str(u.calls), fmt_tokens(u.input), cache, fmt_tokens(u.output),
                 fmt_tokens(u.reasoning), fmt_tokens(u.total)]
 
     def cmd_usage(self, _: str) -> None:

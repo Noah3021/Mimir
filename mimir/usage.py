@@ -27,6 +27,11 @@ class Usage:
     def total(self) -> int:
         return self.input + self.output
 
+    @property
+    def cache_rate(self) -> float:
+        """缓存命中率：命中 token / 输入 token（input 已包含命中部分）。"""
+        return self.cache_read / self.input if self.input else 0.0
+
     def add(self, other: "Usage") -> "Usage":
         for f in fields(self):
             setattr(self, f.name, getattr(self, f.name) + getattr(other, f.name))
@@ -69,7 +74,7 @@ def fmt_tokens(n: int) -> str:
 def format_usage_line(u: Usage, elapsed: float | None = None) -> str:
     inp = f"↑ {fmt_tokens(u.input)}"
     if u.cache_read:
-        inp += f"（缓存 {fmt_tokens(u.cache_read)}）"
+        inp += f"（缓存 {fmt_tokens(u.cache_read)}，{u.cache_rate:.0%}）"
     out = f"↓ {fmt_tokens(u.output)}"
     if u.reasoning:
         out += f"（推理 {fmt_tokens(u.reasoning)}）"

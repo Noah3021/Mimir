@@ -45,7 +45,7 @@ python main.py        # 或：python -m mimir
 
 ## 配置说明（config.yaml）
 
-- `agent`：名称、默认模型、系统提示词（支持 `{now}` `{workspace}` 等占位符）、单轮最大步数、历史消息上限。
+- `agent`：名称、默认模型、系统提示词（支持 `{date}` `{workspace}` 等占位符；每个会话只渲染一次，以便命中提示词缓存）、单轮最大步数、历史消息上限。
 - `models`：任意多个 OpenAI 兼容模型，值可用 `${ENV}` / `${ENV:默认值}` 引用 .env；额外字段（如 `use_responses_api`、`reasoning`、`extra_body`）原样传给 `ChatOpenAI`。
 - `tools`：工作目录、禁用工具、需确认的工具、输出长度上限、Shell 超时与黑名单。
 - `memory`：SQLite 数据库路径；`transcripts` 明文对话记录的开关与目录。
