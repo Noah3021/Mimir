@@ -2,3 +2,7 @@ data/
 __pycache__/
 *.py[cod]
 .env
+
+# 个人笔记（不上传）
+CHANGELOG.md
+项目技术解读.md
