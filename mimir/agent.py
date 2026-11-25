@@ -10,6 +10,7 @@ from .config import ConfigError, ModelConfig, Settings, normalize_reasoning
 from .graph import build_agent_graph
 from .llm import create_llm
 from .memory import SessionStore
+from .project_context import ProjectContext, collect_project_context, latest_update, read_project_file
 from .prompts import render_system_prompt
 from .tools import build_tools
 from .transcript import TranscriptWriter, now_iso
@@ -43,6 +44,8 @@ class AgentRuntime:
         self._extra_calls: list[AIMessage] = []  # 本轮不在消息历史里的模型调用（如上下文摘要）
         # 系统提示词缓存：键为 (会话 ID, 模型名)。同一会话内保持逐字不变，以命中提示词缓存
         self._prompt_cache: tuple[tuple[str, str], str] | None = None
+        # 项目上下文缓存：键为会话 ID。每个会话只收集一次（快照），会话内保持不变
+        self._project_cache: tuple[str, ProjectContext] | None = None
         self.thread_id = SessionStore.new_session_id()
         self.model_name = ""
         self.graph = None
@@ -73,6 +76,7 @@ class AgentRuntime:
             llm=llm,
             tools=self.tools,
             system_prompt=lambda: self._system_prompt(mc),
+            project_context=self.project_info,
             approval=self.approval,
             checkpointer=self.store.checkpointer,
             context=self.settings.agent.context,
@@ -117,6 +121,43 @@ class AgentRuntime:
         )
         self._prompt_cache = (key, text)
         return text
+
+    def project_info(self) -> ProjectContext:
+        """当前会话的项目上下文快照（项目说明文件 + git 状态）。新建 / 恢复会话时才重新收集，会话内不变。"""
+        if self._project_cache and self._project_cache[0] == self.thread_id:
+            return self._project_cache[1]
+        p = self.settings.agent.project
+        ctx = collect_project_context(self.settings.tools.workspace, file=p.file, git=p.git_status,
+                                      max_chars=p.max_chars)
+        self._project_cache = (self.thread_id, ctx)
+        logger.info("项目上下文：项目说明 %s，git 状态%s", ctx.project_file or "无",
+                    "已收集" if ctx.git else "无")
+        return ctx
+
+    def check_project_update(self) -> dict | None:
+        """每轮开始时调用：项目说明文件与模型最近看到的版本不同时，返回要记在本轮用户消息上的更新记录。
+
+        “最近看到的版本”是会话历史中最后一次更新记录；没有更新记录时是会话开始时的快照。
+        文件被删除时返回 text 为空的记录。
+        """
+        p = self.settings.agent.project
+        if not p.file:
+            return None
+        base = self.project_info()
+        try:
+            last = latest_update(self.messages())
+        except Exception:
+            logger.exception("读取会话历史失败")
+            last = None
+        if last is not None:
+            known = (str(last.get("text") or ""), bool(last.get("truncated")))
+        else:
+            known = (base.project_text, base.project_truncated)
+        _, text, truncated = read_project_file(self.settings.tools.workspace, p.file, p.max_chars)
+        if (text, truncated) == known:
+            return None
+        logger.info("项目说明 %s 在会话中途%s，本轮附带最新内容（%d 字）", p.file, "被修改" if text else "被删除", len(text))
+        return {"file": p.file, "text": text, "truncated": truncated}
 
     # ---------- 会话 ----------
     def run_config(self) -> dict:

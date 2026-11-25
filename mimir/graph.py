@@ -34,6 +34,7 @@ except ImportError:  # 旧版 langgraph
 from .approval import ApprovalPolicy
 from .config import ContextConfig
 from .context import ContextPlan, estimate_message_tokens, estimate_text_tokens, history_budget, plan_context
+from .project_context import ProjectContext, inject_context, inject_updates, latest_update
 from .summary import build_summary_request, split_chunks, summary_block
 from .tool_clearing import clear_boundary, clear_old_tool_outputs
 
@@ -163,6 +164,7 @@ def build_agent_graph(
     tools: Sequence[BaseTool],
     system_prompt: Callable[[], str],
     approval: ApprovalPolicy,
+    project_context: Callable[[], ProjectContext] | None = None,
     checkpointer: BaseCheckpointSaver | None,
     context: ContextConfig | None = None,
     context_window: int | None = None,
@@ -179,6 +181,13 @@ def build_agent_graph(
     clearing = ctx.clear_keep_turns > 0
     # 新摘要的预估 token（摘要按 summary_chars 字控制长度，按最坏情况 1 字 1 token 计）
     summary_reserve = estimate_text_tokens(summary_block("中" * ctx.summary_chars))
+
+    def project_text(msgs: Sequence[BaseMessage], cut: int) -> str:
+        """拼在第一条用户消息前的项目上下文。已被摘要压缩掉的消息里如有项目说明更新，
+        改用其中最新的版本（更新提醒随消息一起被压缩，最新内容要保留下来）；只在压缩点前移时变化。"""
+        if project_context is None:
+            return ""
+        return project_context().with_update(latest_update(msgs[:cut])).render()
 
     def invoke_with_retry(runnable: Runnable, messages: list[BaseMessage], config: RunnableConfig) -> AIMessage:
         writer = _stream_writer()
@@ -202,9 +211,10 @@ def build_agent_graph(
                 time.sleep(delay)
 
     def plan(state: AgentState) -> tuple[ContextPlan, int, int]:
-        msgs = state["messages"]
         summary, cut, cb = context_state(state)
-        overhead = estimate_text_tokens(system_prompt()) + tools_tokens
+        msgs = inject_updates(state["messages"])  # 项目说明更新提醒计入对应用户消息的 token
+        overhead = (estimate_text_tokens(system_prompt()) + tools_tokens
+                    + estimate_text_tokens(project_text(state["messages"], cut)))
         high, low = history_budget(window, ctx.high, ctx.low, reserve=ctx.output_reserve, overhead=overhead)
         p = plan_context(
             msgs, high=high, low=low, cut=cut, clear_before=cb,
@@ -270,6 +280,10 @@ def build_agent_graph(
         if cb:
             msgs = clear_old_tool_outputs(msgs, cb, min_chars=ctx.clear_min_chars)
         history = _adapt_for_profile(list(msgs)[cut:], profile)
+        # 项目说明更新提醒拼在记录它的那条用户消息前面；项目上下文拼在（压缩后剩余的）第一条用户消息前面。
+        # 两者都只影响发送内容，不改动状态里的消息
+        history = inject_updates(history)
+        history = inject_context(history, project_text(state["messages"], cut))
         messages = [SystemMessage(system_prompt() + summary_block(summary)), *history]
         response = invoke_with_retry(model, messages, config)
         response.response_metadata["agent_profile"] = profile

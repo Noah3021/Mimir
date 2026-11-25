@@ -239,7 +239,20 @@ class AgentCLI:
         except Exception:
             logger.exception("修复中断的工具调用失败")
 
-        payload: Any = {"messages": [HumanMessage(user_input)]}
+        # 项目说明（MIMIR.md）在会话中途变化时，把最新内容记在本轮用户消息上，发送时附带提醒
+        from .project_context import PROJECT_UPDATE_KEY
+        update = None
+        try:
+            update = self.rt.check_project_update()
+        except Exception:
+            logger.exception("检查项目说明更新失败")
+        if update:
+            self.console.print(Text(f"  ◇ 检测到 {update['file']} 已{'修改' if update['text'] else '删除'}，"
+                                    "本轮会把最新内容告诉模型", style="cyan"))
+            message = HumanMessage(user_input, additional_kwargs={PROJECT_UPDATE_KEY: update})
+        else:
+            message = HumanMessage(user_input)
+        payload: Any = {"messages": [message]}
         always_allow: set[str] = set()
         self.console.print(Text(f"{self.settings.agent.name} ›", style="bold cyan"))
         try:
@@ -652,6 +665,7 @@ class AgentCLI:
             ("推理强度", self.rt.reasoning_level),
             ("当前会话", self.rt.thread_id),
             ("工作目录", str(s.tools.workspace)),
+            ("项目上下文", self._project_desc()),
             ("会话数据库", str(s.memory.db_path)),
             ("对话记录", str(self.rt.transcript.path(self.rt.thread_id)) if s.memory.transcripts_enabled else "已关闭"),
             ("日志文件", str(s.logging.file or "-")),
@@ -671,6 +685,19 @@ class AgentCLI:
         window = self.rt.model_config.context_window or c.window
         clear = f"清理 {c.clear_keep_turns} 轮前的工具输出，" if c.clear_keep_turns else ""
         return f"{window:,} tokens（{c.high:.0%} 触发压缩 → {c.low:.0%}，{clear}较早对话压缩为摘要）"
+
+    def _project_desc(self) -> str:
+        p = self.settings.agent.project
+        try:
+            ctx = self.rt.project_info()
+        except Exception:
+            return "-"
+        if ctx.project_file:
+            doc = f"{ctx.project_file.name}（{len(ctx.project_text):,} 字{'，已截断' if ctx.project_truncated else ''}）"
+        else:
+            doc = f"未找到 {p.file}" if p.file else "未启用项目说明"
+        git = "git 状态" if ctx.git else ("非 git 仓库" if p.git_status else "未启用 git 状态")
+        return f"{doc} + {git}（会话开始时的快照）"
 
     def _summary_desc(self) -> str:
         try:

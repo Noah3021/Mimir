@@ -88,6 +88,13 @@ class ContextConfig:
 
 
 @dataclass
+class ProjectConfig:
+    file: str = "MIMIR.md"           # 工作目录下的项目说明文件；空字符串 = 不读取
+    git_status: bool = True          # 会话开始时注入 git 分支、工作区状态和最近提交
+    max_chars: int = 20_000          # 项目说明最多读取的字符数，超出截断
+
+
+@dataclass
 class AgentConfig:
     name: str
     system_prompt: str
@@ -95,6 +102,7 @@ class AgentConfig:
     recursion_limit: int = 50
     stream_retries: int = 5          # 连接中断时自动重发请求的最大次数
     context: ContextConfig = field(default_factory=ContextConfig)
+    project: ProjectConfig = field(default_factory=ProjectConfig)
 
 
 @dataclass
@@ -227,6 +235,20 @@ def _parse_context(raw: Any) -> ContextConfig:
     return ctx
 
 
+def _parse_project(raw: Any) -> ProjectConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError("agent.project 必须是键值对")
+    d = ProjectConfig()
+    git = raw.get("git_status", d.git_status)
+    if isinstance(git, str):
+        git = git.strip().lower() in ("true", "yes", "on", "1")
+    return ProjectConfig(
+        file=str(raw.get("file", d.file) or "").strip(),
+        git_status=bool(git),
+        max_chars=max(1000, _to_number(raw.get("max_chars"), int, d.max_chars, "agent.project.max_chars")),
+    )
+
+
 def load_settings(config_path: str | Path | None = None, *, workspace: str | Path | None = None) -> Settings:
     load_env_files()
 
@@ -262,6 +284,7 @@ def load_settings(config_path: str | Path | None = None, *, workspace: str | Pat
         recursion_limit=_to_number(a.get("recursion_limit"), int, 50, "agent.recursion_limit"),
         stream_retries=max(0, _to_number(a.get("stream_retries"), int, 5, "agent.stream_retries")),
         context=_parse_context(a.get("context") or {}),
+        project=_parse_project(a.get("project") or {}),
     )
 
     # ---- tools ----
