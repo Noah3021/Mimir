@@ -14,6 +14,7 @@ from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 from rich.console import Console, Group
 from rich.live import Live
+from rich.segment import Segment
 from rich.markdown import Markdown
 from rich.markup import escape
 from rich.panel import Panel
@@ -63,8 +64,32 @@ def clip_lines(text: str, max_lines: int = 40) -> str:
     return "\n".join(lines[:max_lines]) + f"\n…（共 {len(lines)} 行，仅显示前 {max_lines} 行）"
 
 
+class _Tail:
+    """只渲染内容的最后若干行，保证 Live 区域始终不超过终端高度。
+
+    Live 刷新时需要把光标移回上一帧顶部重绘；内容一旦高于终端，顶部已滚出屏幕、
+    无法擦除，旧帧就会残留在滚动区里，看起来像重复输出。
+    """
+
+    def __init__(self, renderable: Any):
+        self.renderable = renderable
+
+    def __rich_console__(self, console: Console, options):
+        max_lines = max(console.size.height - 2, 3)
+        lines = console.render_lines(self.renderable, options, pad=False)
+        if len(lines) > max_lines:
+            lines = lines[-max_lines:]
+        for line in lines:
+            yield from line
+            yield Segment.line()
+
+
 class StreamPrinter:
-    """管理流式输出：等待动画 / 推理过程 / 正文（Markdown 实时渲染）。"""
+    """管理流式输出：等待动画 / 推理过程 / 正文（Markdown 实时渲染）。
+
+    流式过程中只在 Live 区域显示末尾一屏；结束时清除 Live 区域，再完整打印一次，
+    终端中最终只保留一份完整内容。
+    """
 
     def __init__(self, console: Console, show_reasoning: bool = True):
         self.console = console
@@ -85,28 +110,26 @@ class StreamPrinter:
             return
         if self.mode != kind:
             self.end()
-            if kind == "reasoning":
-                self.console.print(Text("思考过程", style="dim bold"))
             self.mode, self.buf = kind, ""
-            self.live = Live(self._render(), console=self.console, refresh_per_second=10,
-                             vertical_overflow="visible")
+            self.live = Live(_Tail(self._render()), console=self.console, refresh_per_second=10,
+                             transient=True, vertical_overflow="crop")
             self.live.start()
         self.buf += s
-        self.live.update(self._render())
+        self.live.update(_Tail(self._render()))
 
     def _render(self):
-        if self.mode == "reasoning":
-            return Text(self.buf.strip(), style="dim italic")
+        if self.mode == "reasoning":  # 标题放在 Live 内，随流式区域一并清除
+            return Group(Text("思考过程", style="dim bold"), Text(self.buf.strip(), style="dim italic"))
         return Markdown(self.buf.strip())
 
     def end(self) -> None:
         if self.live is not None:
             try:
-                if self.mode in ("text", "reasoning"):
-                    self.live.update(self._render(), refresh=True)
-                self.live.stop()
+                self.live.stop()  # transient=True：清除流式区域
             finally:
                 self.live = None
+            if self.mode in ("text", "reasoning") and self.buf.strip():
+                self.console.print(self._render())  # 最终只完整打印一次
         self.mode, self.buf = None, ""
 
 
