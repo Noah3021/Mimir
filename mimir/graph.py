@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Callable, Sequence
 
 from langchain_core.language_models import BaseChatModel
@@ -17,6 +18,11 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.types import interrupt
+
+try:
+    from langgraph.config import get_stream_writer
+except ImportError:  # 旧版 langgraph
+    get_stream_writer = None
 
 from .approval import ApprovalPolicy
 
@@ -58,6 +64,35 @@ def extract_chunk(msg: BaseMessage) -> tuple[str, str]:
     if isinstance(rc, str):
         reasoning += rc
     return reasoning, text
+
+
+# 可重试的网络类错误（按类名匹配，兼容 openai / anthropic / httpx 及 LangChain 的包装类）
+_TRANSIENT_ERROR_NAMES = {
+    "APIConnectionError", "APITimeoutError", "OpenAIConnectionError",
+    "RemoteProtocolError", "ReadError", "ConnectError", "ReadTimeout", "ConnectTimeout",
+}
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """沿异常链判断是否为连接中断 / 超时等可重试错误。"""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if any(c.__name__ in _TRANSIENT_ERROR_NAMES for c in type(cur).__mro__):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _stream_writer() -> Callable[[Any], None]:
+    """获取 LangGraph 自定义流写入器，用于通知 CLI 重试；不可用时返回空函数。"""
+    if get_stream_writer is None:
+        return lambda _: None
+    try:
+        return get_stream_writer()
+    except Exception:
+        return lambda _: None
 
 
 def _to_text(output: Any) -> str:
@@ -112,13 +147,34 @@ def build_agent_graph(
     max_history_messages: int = 60,
     profile: str = "default",
     max_tool_output_chars: int = 8000,
+    max_stream_retries: int = 5,
 ):
     tools_by_name = {t.name: t for t in tools}
     model = llm.bind_tools(list(tools)) if tools else llm
 
     def agent_node(state: MessagesState, config: RunnableConfig):
         history = _prepare_history(state["messages"], max_history_messages, profile)
-        response = model.invoke([SystemMessage(system_prompt()), *history], config)
+        messages = [SystemMessage(system_prompt()), *history]
+        writer = _stream_writer()
+        attempt = 0
+        while True:
+            try:
+                response = model.invoke(messages, config)
+                break
+            except GraphBubbleUp:
+                raise
+            except Exception as e:
+                # SDK 自带的 max_retries 只在收到响应前重试；流式传输中途断开需要在这里重发整个请求。
+                # 失败的那次没有产生任何消息，重发不会污染历史，也不影响提示词缓存。
+                if attempt >= max_stream_retries or not is_transient_error(e):
+                    raise
+                attempt += 1
+                delay = min(2 ** (attempt - 1), 8)  # 1, 2, 4, 8, 8 秒
+                logger.warning("模型请求连接中断（%s: %s），%ss 后第 %d/%d 次重试",
+                               type(e).__name__, e, delay, attempt, max_stream_retries)
+                writer({"type": "retry", "attempt": attempt, "max": max_stream_retries,
+                        "delay": delay, "error": f"{type(e).__name__}: {e}"})
+                time.sleep(delay)
         response.response_metadata["agent_profile"] = profile
         return {"messages": [response]}
 

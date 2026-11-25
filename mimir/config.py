@@ -82,6 +82,7 @@ class AgentConfig:
     default_model: str
     recursion_limit: int = 50
     max_history_messages: int = 60
+    stream_retries: int = 5          # 连接中断时自动重发请求的最大次数
 
 
 @dataclass
@@ -224,6 +225,7 @@ def load_settings(config_path: str | Path | None = None, *, workspace: str | Pat
         default_model=default_model,
         recursion_limit=_to_number(a.get("recursion_limit"), int, 50, "agent.recursion_limit"),
         max_history_messages=_to_number(a.get("max_history_messages"), int, 60, "agent.max_history_messages"),
+        stream_retries=max(0, _to_number(a.get("stream_retries"), int, 5, "agent.stream_retries")),
     )
 
     # ---- tools ----

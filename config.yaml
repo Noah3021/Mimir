@@ -7,6 +7,7 @@ agent:
   default_model: deepseek      # 启动时使用的模型（models 下的键名），可用 -m 覆盖
   recursion_limit: 50          # 单轮对话内 LLM <-> 工具 的最大循环步数
   max_history_messages: 60     # 发送给模型的最大历史消息数，超出后从最早的对话开始裁剪
+  stream_retries: 5            # 连接中断（如流式传输中途断开）时自动重发请求的最大次数，0 = 不重试
   # 可用占位符：{agent_name} {date} {weekday} {os} {workspace} {model} {tools}
   # 系统提示词每个会话只渲染一次并保持不变（便于命中提示词缓存），因此不提供精确到秒的时间
   system_prompt: |

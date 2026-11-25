@@ -118,9 +118,18 @@ class StreamPrinter:
         self.live.update(_Tail(self._render()))
 
     def _render(self):
-        if self.mode == "reasoning":  # 标题放在 Live 内，随流式区域一并清除
+        if self.mode == "reasoning":  # 标题放在 Live 内，重试丢弃时一并清除
             return Group(Text("思考过程", style="dim bold"), Text(self.buf.strip(), style="dim italic"))
         return Markdown(self.buf.strip())
+
+    def discard(self) -> None:
+        """丢弃当前流式区域的内容（不打印），用于请求中断后重试。"""
+        if self.live is not None:
+            try:
+                self.live.stop()  # transient=True：清除已显示的半截内容
+            finally:
+                self.live = None
+        self.mode, self.buf = None, ""
 
     def end(self) -> None:
         if self.live is not None:
@@ -255,6 +264,10 @@ class AgentCLI:
             self.printer.end()
             logger.exception("对话出错")
             self.console.print(f"[red]出错：{type(e).__name__}: {escape(str(e))}[/]")
+            from .graph import is_transient_error
+            if is_transient_error(e):
+                self.console.print(f"[yellow]连接多次中断（已自动重试 {self.settings.agent.stream_retries} 次），"
+                                   "请检查网络或代理后重新发送；可在 config.yaml 调整 agent.stream_retries[/]")
         finally:
             self.printer.end()
             for name in always_allow:  # 一轮结束后再更新策略，避免中断恢复时重放不一致
@@ -278,7 +291,7 @@ class AgentCLI:
 
     def _stream(self, payload: Any, config: dict) -> None:
         streaming = self.settings.cli.stream
-        modes = ["messages", "updates"] if streaming else ["updates"]
+        modes = ["messages", "updates", "custom"] if streaming else ["updates", "custom"]
         self.printer.wait()
         for mode, data in self.rt.graph.stream(payload, config, stream_mode=modes):
             if mode == "messages":
@@ -288,10 +301,21 @@ class AgentCLI:
                 reasoning, text = extract_chunk(chunk)
                 self.printer.feed("reasoning", reasoning)
                 self.printer.feed("text", text)
+            elif mode == "custom" and isinstance(data, dict) and data.get("type") == "retry":
+                self._handle_retry(data)
             elif mode == "updates" and isinstance(data, dict):
                 self._handle_update(data, streaming)
                 self.rt.sync_transcript()  # 每个节点完成后立即追加，时间戳更准确
         self.printer.end()
+
+    def _handle_retry(self, data: dict) -> None:
+        """模型请求连接中断：清掉半截输出，提示并等待重试。"""
+        self.printer.discard()
+        attempt, total, delay = data.get("attempt"), data.get("max"), data.get("delay")
+        self.console.print(Text.assemble(
+            ("  ⟳ ", "yellow"), (f"连接中断，{delay}s 后重试（{attempt}/{total}）", "yellow"),
+            " ", (short(str(data.get("error", "")), 100), "dim")))
+        self.printer.wait("重新连接中…")
 
     def _handle_update(self, data: dict, streaming: bool) -> None:
         for node, value in data.items():

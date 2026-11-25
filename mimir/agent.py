@@ -77,6 +77,7 @@ class AgentRuntime:
             max_history_messages=self.settings.agent.max_history_messages,
             profile=name,
             max_tool_output_chars=self.settings.tools.max_output_chars,
+            max_stream_retries=self.settings.agent.stream_retries,
         )
         self.model_name = name
         logger.info("使用模型 %s (%s)，推理强度 %s", name, mc.model, self.reasoning_for(name))
