@@ -6,7 +6,7 @@
 
 ```bash
 cd Mimir
-conda activate agent   # 或任意 Python 3.10+ 环境
+conda activate agent   # 或任意 Python 3.11+ 环境（LangChain 1.8 起不再支持 3.10）
 pip install -r requirements.txt
 # 配置环境变量：复制 .env.example 为 .env 后填写（也可复用上级目录的 .env）
 python main.py        # 或：python -m mimir

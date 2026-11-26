@@ -4,7 +4,8 @@
 #
 # 锁定范围：requirements*.txt 里的直接依赖，加上 LangChain / LangGraph 生态里迭代快、容易出现
 # 不兼容改动的间接依赖（langchain-core、langgraph-*、openai、anthropic、pydantic）。
-# 其他通用的间接依赖（httpx、certifi 等）不锁，避免某个版本不支持 Python 3.10 或某个系统时装不上。
+# 其他通用的间接依赖（httpx、certifi 等）不锁，避免某个版本不支持某个 Python 版本或系统时装不上。
+# 注意：锁定的 LangChain 1.8+ 要求 Python 3.11 及以上，项目从 2026-11-26 起不再支持 3.10。
 #
 # 更新：CI 的 test-latest 任务（每周一定时 / 手动触发）用最新版本跑测试，通过后：
 #   1. 新建虚拟环境，pip install --upgrade -r requirements-dev.txt
