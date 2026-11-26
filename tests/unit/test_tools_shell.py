@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from mimir.tools.shell import build_shell_tools
+from mimir.tools.shell import build_shell_tools, find_blocked_pattern
 
 PY = f'"{sys.executable}"'
 
@@ -80,8 +80,44 @@ def test_blocked_patterns(tools_config, fake_run, command):
     assert fake_run == []
 
 
-@pytest.mark.xfail(reason="已知问题：黑名单按子串匹配，多一个空格即可绕过；改为规则式权限后应通过", strict=True)
-def test_blocked_patterns_whitespace_bypass(tools_config, fake_run):
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm  -rf /",          # 多一个空格
+        "rm\t-rf /",          # 制表符
+        "rm -rf  /",
+        "r'm' -rf /",         # sh 引号拆开关键字
+        'r"m" -rf /',
+        "\\rm -rf /",         # sh 反斜杠
+        "r^m -rf /",          # cmd 转义符
+        "echo ok &&\n rm -rf /",
+    ],
+)
+def test_blocked_patterns_obfuscation(tools_config, fake_run, command):
     run = shell(tools_config, blocked_patterns=["rm -rf /"])
-    out = run.invoke({"command": "rm  -rf /"})
-    assert "已拒绝" in out and fake_run == []
+    assert "已拒绝" in run.invoke({"command": command})
+    assert fake_run == []
+
+
+@pytest.mark.parametrize(
+    "command, pattern",
+    [
+        (":(){ :|:& };:", ":(){"),
+        (": ( ) { : | : & } ; :", ":(){"),   # 带空格的 fork bomb
+        ("FORMAT  C:", "format c:"),
+        ("mkfs.ext4 /dev/sda1", "mkfs"),
+    ],
+)
+def test_default_patterns(command, pattern):
+    assert find_blocked_pattern(command, ["rm -rf /", "format c:", "mkfs", ":(){"]) == pattern
+
+
+@pytest.mark.parametrize("command", ["rm -rf ./build", "echo hello world", "git status"])
+def test_normal_commands_not_blocked(tools_config, fake_run, command):
+    run = shell(tools_config, blocked_patterns=["rm -rf /", "format c:", "mkfs", ":(){"])
+    assert "已拒绝" not in run.invoke({"command": command})
+    assert fake_run == [command]
+
+
+def test_empty_pattern_ignored():
+    assert find_blocked_pattern("echo hi", ["", "   "]) is None
