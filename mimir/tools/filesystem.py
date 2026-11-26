@@ -26,14 +26,17 @@ def _human_size(n: int) -> str:
 
 
 def _read_text(p: Path) -> tuple[str, str]:
-    """读取文本文件，返回 (内容, 编码)。依次尝试 utf-8 / gbk。"""
+    """读取文本文件，返回 (内容, 编码)。依次尝试 utf-8 / gbk。
+
+    只有文件确实以 BOM 开头时才返回 utf-8-sig：编码会原样用于写回，utf-8-sig 写入时会在开头加 BOM。
+    """
     size = p.stat().st_size
     if size > MAX_FILE_BYTES:
         raise ValueError(f"文件过大（{_human_size(size)}），超过 {_human_size(MAX_FILE_BYTES)} 限制")
     data = p.read_bytes()
     if b"\x00" in data[:8192]:
         raise ValueError("疑似二进制文件，无法按文本读取")
-    for enc in ("utf-8-sig", "gbk"):
+    for enc in ("utf-8-sig" if data.startswith(b"\xef\xbb\xbf") else "utf-8", "gbk"):
         try:
             return data.decode(enc), enc
         except UnicodeDecodeError:
