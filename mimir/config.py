@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -10,8 +11,10 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+# 默认配置随包发布（不含模型和密钥）；用户配置在 MIMIR_HOME（默认 ~/.mimir）下，启动时覆盖在默认配置上
+PACKAGE_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG_PATH = PACKAGE_DIR / "default_config.yaml"
+HOME_ENV = "MIMIR_HOME"
 
 # ${VAR} 或 ${VAR:默认值}（也兼容 ${VAR:-默认值}）
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-?([^}]*))?\}")
@@ -30,6 +33,24 @@ _REASONING_ALIASES = {
 
 class ConfigError(Exception):
     """配置错误。"""
+
+
+class SetupRequired(ConfigError):
+    """还没有用户配置（未指定 -c 且 MIMIR_HOME 下没有 config.yaml），需要先运行 mimir init。"""
+
+
+def mimir_home() -> Path:
+    """用户配置与数据目录：环境变量 MIMIR_HOME，未设置时为 ~/.mimir。"""
+    value = os.environ.get(HOME_ENV, "").strip()
+    return (Path(value).expanduser() if value else Path.home() / ".mimir").resolve()
+
+
+def user_config_path() -> Path:
+    return mimir_home() / "config.yaml"
+
+
+def user_env_path() -> Path:
+    return mimir_home() / ".env"
 
 
 def normalize_reasoning(value: Any, field_name: str = "reasoning") -> str:
@@ -151,10 +172,10 @@ class Settings:
 
 
 def load_env_files() -> list[Path]:
-    """依次加载 .env：当前目录 -> 项目目录 -> 项目上级目录。先加载的优先（不覆盖）。"""
+    """依次加载 .env：当前目录 -> MIMIR_HOME/.env。先加载的优先（不覆盖已有的环境变量）。"""
     loaded = []
     seen = set()
-    for p in (Path.cwd() / ".env", PROJECT_ROOT / ".env", PROJECT_ROOT.parent / ".env"):
+    for p in (Path.cwd() / ".env", user_env_path()):
         rp = p.resolve()
         if rp in seen or not rp.is_file():
             continue
@@ -164,16 +185,17 @@ def load_env_files() -> list[Path]:
     return loaded
 
 
-def _interpolate(value: Any) -> Any:
+def _interpolate(value: Any, lookup: Callable[[str], str | None] = os.getenv) -> Any:
+    """替换 ${VAR} / ${VAR:默认值}。lookup 默认读环境变量；导入旧配置时传入旧 .env 的取值。"""
     if isinstance(value, dict):
-        return {k: _interpolate(v) for k, v in value.items()}
+        return {k: _interpolate(v, lookup) for k, v in value.items()}
     if isinstance(value, list):
-        return [_interpolate(v) for v in value]
+        return [_interpolate(v, lookup) for v in value]
     if not isinstance(value, str):
         return value
 
     whole = _ENV_PATTERN.fullmatch(value.strip()) is not None
-    result = _ENV_PATTERN.sub(lambda m: os.getenv(m.group(1)) or (m.group(2) or ""), value)
+    result = _ENV_PATTERN.sub(lambda m: lookup(m.group(1)) or (m.group(2) or ""), value)
     # 整个值就是一个占位符时，尝试还原数字/布尔类型
     if whole and _SCALAR_PATTERN.match(result.strip()):
         return yaml.safe_load(result.strip())
@@ -249,17 +271,46 @@ def _parse_project(raw: Any) -> ProjectConfig:
     )
 
 
-def load_settings(config_path: str | Path | None = None, *, workspace: str | Path | None = None) -> Settings:
-    load_env_files()
-
-    path = Path(config_path).expanduser() if config_path else DEFAULT_CONFIG_PATH
-    if not path.is_file():
-        raise ConfigError(f"找不到配置文件：{path}")
+def read_yaml(path: Path) -> dict[str, Any]:
+    """读取 YAML 配置文件；空文件返回 {}。"""
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except yaml.YAMLError as e:
-        raise ConfigError(f"配置文件解析失败：{e}") from e
-    data = _interpolate(raw)
+        raise ConfigError(f"配置文件 {path} 解析失败：{e}") from e
+    except OSError as e:
+        raise ConfigError(f"无法读取配置文件 {path}：{e}") from e
+    if not isinstance(raw, dict):
+        raise ConfigError(f"配置文件 {path} 的顶层必须是键值对")
+    return raw
+
+
+def deep_merge(base: Any, override: Any) -> Any:
+    """用户配置覆盖默认配置：两边都是字典时逐键合并，否则（标量、列表）整体替换。不修改传入的对象。"""
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = dict(base)
+        for k, v in override.items():
+            merged[k] = deep_merge(base[k], v) if k in base else v
+        return merged
+    return override
+
+
+def load_settings(config_path: str | Path | None = None, *, workspace: str | Path | None = None) -> Settings:
+    """读取默认配置，再用用户配置覆盖。
+
+    用户配置：-c 指定的文件；未指定时为 MIMIR_HOME/config.yaml，不存在则抛出 SetupRequired。
+    相对路径（数据库、对话记录、日志等）相对用户配置所在目录。
+    """
+    load_env_files()
+
+    if config_path:
+        path = Path(config_path).expanduser()
+        if not path.is_file():
+            raise ConfigError(f"找不到配置文件：{path}")
+    else:
+        path = user_config_path()
+        if not path.is_file():
+            raise SetupRequired(f"还没有配置模型（{path} 不存在），请先运行 mimir init")
+    data = _interpolate(deep_merge(read_yaml(DEFAULT_CONFIG_PATH), read_yaml(path)))
     base_dir = path.resolve().parent
 
     def resolve_path(value: Any, default: str) -> Path:
@@ -269,7 +320,7 @@ def load_settings(config_path: str | Path | None = None, *, workspace: str | Pat
     # ---- models ----
     models_raw = data.get("models") or {}
     if not models_raw:
-        raise ConfigError("配置中至少需要定义一个模型（models）")
+        raise ConfigError(f"{path} 中还没有配置模型（models），请运行 mimir init 添加")
     models = {str(name): _parse_model(str(name), m) for name, m in models_raw.items()}
 
     # ---- agent ----

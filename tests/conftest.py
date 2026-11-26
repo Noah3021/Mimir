@@ -17,6 +17,14 @@ def no_env_files(monkeypatch):
     monkeypatch.setattr("mimir.config.load_env_files", lambda: [])
 
 
+@pytest.fixture(autouse=True)
+def mimir_home(tmp_path, monkeypatch):
+    """MIMIR_HOME 指向临时目录，测试不会读写本机的 ~/.mimir。"""
+    home = tmp_path / "mimir_home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    return home
+
+
 @pytest.fixture
 def workspace(tmp_path):
     ws = tmp_path / "ws"
