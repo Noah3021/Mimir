@@ -1,4 +1,39 @@
-# 目前只放开发工具配置；以后打包时再补 [project] 等部分。
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mimir-agent"
+dynamic = ["version"]
+description = "Mimir —— 基于 LangChain + LangGraph 的个人 CLI 智能体"
+readme = "README.md"
+requires-python = ">=3.11"
+# 和 requirements.txt 保持一致
+dependencies = [
+    "langchain-core>=1.0",
+    "langchain-openai>=1.0",
+    "langchain-deepseek>=1.0",
+    "langchain-anthropic>=1.0",
+    "langgraph>=1.0",
+    "langgraph-checkpoint-sqlite>=2.0",
+    "python-dotenv>=1.0",
+    "PyYAML>=6.0",
+    "rich>=13.0",
+    "prompt_toolkit>=3.0",
+    "tzdata; sys_platform == 'win32'",
+]
+
+[project.scripts]
+mimir = "mimir.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "mimir.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["mimir*"]
+
+[tool.setuptools.package-data]
+mimir = ["default_config.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -69,3 +69,39 @@ jobs:
       - run: pip install --upgrade -r requirements-dev.txt
       - run: pip freeze
       - run: python -m pytest
+
+  package:
+    # 构建 wheel，在干净的虚拟环境里安装，确认装出来的 mimir 命令能用（默认配置已打进包里）
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install build
+      - run: python -m build --wheel --outdir dist
+      - name: 在干净环境中安装并运行
+        env:
+          MIMIR_HOME: ${{ runner.temp }}/mimir-home
+          PYTHONIOENCODING: utf-8
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          if [ -d "$RUNNER_TEMP/venv/Scripts" ]; then BIN="$RUNNER_TEMP/venv/Scripts"; else BIN="$RUNNER_TEMP/venv/bin"; fi
+          "$BIN/python" -m pip install dist/*.whl -c constraints.txt
+          cd "$RUNNER_TEMP"   # 离开仓库目录，确保用的是安装好的包
+          "$BIN/mimir" --version
+          "$BIN/mimir" init --help
+          # 没有配置时 doctor 应该提示运行 mimir init，并以 1 退出
+          set +e
+          out=$("$BIN/mimir" doctor --offline); code=$?
+          set -e
+          echo "$out"
+          [ "$code" -eq 1 ] && echo "$out" | grep -q "mimir init"
