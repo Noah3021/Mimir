@@ -26,7 +26,8 @@ DEFAULT_MAX_OUTPUT = 8192
 def create_llm(mc: ModelConfig, *, streaming: bool = True, reasoning: str | None = None) -> BaseChatModel:
     if not mc.available:
         raise ConfigError(
-            f"模型 '{mc.name}' 配置不完整，缺少：{', '.join(mc.missing_fields())}（请检查 .env 或 config.yaml）"
+            f"模型 '{mc.name}' 配置不完整，缺少：{', '.join(mc.missing_fields())}"
+            "（运行 mimir doctor 查看，或运行 mimir init 重新添加）"
         )
     level = normalize_reasoning(reasoning) if reasoning else mc.reasoning
     builders: dict[str, Callable[[ModelConfig, str, bool], BaseChatModel]] = {
@@ -37,7 +38,9 @@ def create_llm(mc: ModelConfig, *, streaming: bool = True, reasoning: str | None
     try:
         return builders[mc.provider](mc, level, streaming)
     except ImportError as e:
-        raise ConfigError(f"模型 '{mc.name}' 缺少依赖 {e.name or e}，请执行 pip install -r requirements.txt") from e
+        raise ConfigError(
+            f"模型 '{mc.name}' 缺少依赖 {e.name or e}，请重新安装 Mimir（pipx reinstall mimir-agent）"
+        ) from e
 
 
 # ---------------- OpenAI（GPT） ----------------

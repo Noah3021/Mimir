@@ -7,6 +7,7 @@ import logging
 import sys
 import time
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
@@ -25,7 +26,8 @@ from rich.text import Text
 
 from . import __version__
 from .agent import AgentRuntime
-from .config import REASONING_LEVELS, ConfigError, Settings, load_settings
+from .config import REASONING_LEVELS, ConfigError, Settings, SetupRequired, load_settings
+from .onboarding import run_doctor, run_import, run_init
 from .graph import extract_chunk, message_text
 from .usage import Usage, fmt_tokens, format_usage_line
 
@@ -597,7 +599,7 @@ class AgentCLI:
             self.console.print(f"[red]{escape(str(e))}[/]")
             return
         self.console.print(f"[green]{self.rt.model_name} 的推理强度已设为[/] {self.rt.reasoning_level}"
-                           "[dim]（仅本次运行有效，默认值在 config.yaml 中修改）[/]")
+                           f"[dim]（仅本次运行有效，默认值在 {escape(str(self.settings.config_path))} 中修改）[/]")
 
     @staticmethod
     def _usage_cells(u: Usage) -> list[str]:
@@ -731,11 +733,17 @@ def setup_logging(settings: Settings) -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
+SUBCOMMANDS = ("init", "doctor")
+
+
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(prog="mimir", description="Mimir —— 基于 LangChain + LangGraph 的个人 CLI 智能体")
-    p.add_argument("-c", "--config", help="配置文件路径（默认为项目目录下的 config.yaml）")
-    p.add_argument("-m", "--model", help="使用的模型名称（config.yaml 中 models 的键名）")
-    p.add_argument("-t", "--think", choices=REASONING_LEVELS, help="本次运行的推理强度（覆盖 config.yaml）")
+    p = argparse.ArgumentParser(
+        prog="mimir", description="Mimir —— 基于 LangChain + LangGraph 的个人 CLI 智能体",
+        epilog="子命令：mimir init（添加模型 / --import 导入旧版本配置）、mimir doctor（检查环境和模型）",
+    )
+    p.add_argument("-c", "--config", help="配置文件路径（默认为 ~/.mimir/config.yaml，可用环境变量 MIMIR_HOME 改目录）")
+    p.add_argument("-m", "--model", help="使用的模型名称（配置中 models 的键名）")
+    p.add_argument("-t", "--think", choices=REASONING_LEVELS, help="本次运行的推理强度（覆盖配置）")
     p.add_argument("-w", "--workspace", help="文件/命令工具的工作目录（默认为当前目录）")
     g = p.add_mutually_exclusive_group()
     g.add_argument("-r", "--resume", metavar="ID", help="恢复指定会话（ID 或 ID 前缀）")
@@ -759,7 +767,25 @@ def _create_runtime(settings: Settings, args: argparse.Namespace, console: Conso
         if errors:
             console.print(f"[yellow]{escape(errors[0])}，已改用模型 {name}[/]")
         return rt
-    raise ConfigError("没有可用的模型：\n  " + "\n  ".join(errors) + "\n请参考 .env.example 配置环境变量")
+    raise ConfigError("没有可用的模型：\n  " + "\n  ".join(errors)
+                      + "\n运行 mimir doctor 查看原因，或运行 mimir init 重新添加模型")
+
+
+def run_subcommand(name: str, rest: list[str]) -> int:
+    p = argparse.ArgumentParser(prog=f"mimir {name}")
+    if name == "init":
+        p.description = "添加一个模型：选择供应商、填写 API Key，测试连接后保存到 ~/.mimir/。可重复运行。"
+        p.add_argument("--import", dest="import_dir", metavar="DIR",
+                       help="从旧版本的目录（含 config.yaml、.env、data/）导入模型、设置和会话数据，原目录不改动")
+    else:
+        p.description = "检查 Python 版本、配置文件和每个模型能否使用。"
+        p.add_argument("-c", "--config", help="要检查的配置文件（默认为 ~/.mimir/config.yaml）")
+        p.add_argument("--offline", action="store_true", help="不测试模型连接")
+    a = p.parse_args(rest)
+    console = Console()
+    if name == "init":
+        return run_import(console, Path(a.import_dir)) if a.import_dir else run_init(console)
+    return run_doctor(console, a.config, offline=a.offline)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -769,10 +795,23 @@ def main(argv: list[str] | None = None) -> int:
                 stream.reconfigure(encoding="utf-8")
             except Exception:
                 pass
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] in SUBCOMMANDS:
+        return run_subcommand(argv[0], argv[1:])
     args = parse_args(argv)
     console = Console()
     try:
-        settings = load_settings(args.config, workspace=args.workspace)
+        try:
+            settings = load_settings(args.config, workspace=args.workspace)
+        except SetupRequired:
+            # 第一次运行：交互终端里直接进入配置向导；单次提问 / 管道输入时只提示
+            if args.prompt or not sys.stdin.isatty():
+                raise
+            console.print("[yellow]还没有配置模型，先完成首次配置。[/]\n")
+            if run_init(console) != 0:
+                return 1
+            console.print()
+            settings = load_settings(args.config, workspace=args.workspace)
         setup_logging(settings)
         runtime = _create_runtime(settings, args, console)
     except ConfigError as e:
