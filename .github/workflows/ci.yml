@@ -92,6 +92,8 @@ jobs:
         env:
           MIMIR_HOME: ${{ runner.temp }}/mimir-home
           PYTHONIOENCODING: utf-8
+          # 输出不是终端时 rich 按 80 列折行，“mimir init” 可能被折成两行，导致下面的 grep 匹配不到
+          COLUMNS: "200"
         run: |
           python -m venv "$RUNNER_TEMP/venv"
           if [ -d "$RUNNER_TEMP/venv/Scripts" ]; then BIN="$RUNNER_TEMP/venv/Scripts"; else BIN="$RUNNER_TEMP/venv/bin"; fi
