@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]   # 只有推送到 main 才触发；其他分支的改动通过 PR 触发，避免同一份代码跑两遍
   pull_request:
   schedule:
     - cron: "0 1 * * 1"   # 每周一 01:00 UTC（北京时间 09:00），用最新依赖跑一遍
