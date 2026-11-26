@@ -4,7 +4,7 @@ from __future__ import annotations
 import platform
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from collections.abc import Iterable
 
 WEEKDAYS = "一二三四五六日"
 

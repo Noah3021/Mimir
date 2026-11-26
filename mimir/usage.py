@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, fields
 from datetime import datetime
-from typing import Sequence
+from collections.abc import Sequence
 
 from langchain_core.messages import AIMessage, BaseMessage
 
@@ -32,7 +32,7 @@ class Usage:
         """缓存命中率：命中 token / 输入 token（input 已包含命中部分）。"""
         return self.cache_read / self.input if self.input else 0.0
 
-    def add(self, other: "Usage") -> "Usage":
+    def add(self, other: Usage) -> Usage:
         for f in fields(self):
             setattr(self, f.name, getattr(self, f.name) + getattr(other, f.name))
         return self

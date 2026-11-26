@@ -9,7 +9,7 @@ import time
 from datetime import date
 from typing import Any
 
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 from rich.console import Console, Group
@@ -392,7 +392,10 @@ class AgentCLI:
                 lexer = Syntax.guess_lexer(path, content)
             except Exception:
                 lexer = "text"
-            return Group(Text(f"{mode}：{path}", style="bold"), Syntax(content, lexer, line_numbers=True, word_wrap=True))
+            return Group(
+                Text(f"{mode}：{path}", style="bold"),
+                Syntax(content, lexer, line_numbers=True, word_wrap=True),
+            )
         if tool == "edit_file":
             old = clip_lines(str(args.get("old_text", "")), 20)
             new = clip_lines(str(args.get("new_text", "")), 20)
@@ -693,7 +696,8 @@ class AgentCLI:
         except Exception:
             return "-"
         if ctx.project_file:
-            doc = f"{ctx.project_file.name}（{len(ctx.project_text):,} 字{'，已截断' if ctx.project_truncated else ''}）"
+            note = "，已截断" if ctx.project_truncated else ""
+            doc = f"{ctx.project_file.name}（{len(ctx.project_text):,} 字{note}）"
         else:
             doc = f"未找到 {p.file}" if p.file else "未启用项目说明"
         git = "git 状态" if ctx.git else ("非 git 仓库" if p.git_status else "未启用 git 状态")

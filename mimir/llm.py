@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import logging
 from functools import lru_cache
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
@@ -81,7 +82,7 @@ def _deepseek_class():
                 dst = payload.get("messages") or []
                 if len(src) == len(dst):
                     last_human = max((i for i, m in enumerate(src) if isinstance(m, HumanMessage)), default=-1)
-                    for m, d in zip(src[last_human + 1:], dst[last_human + 1:]):
+                    for m, d in zip(src[last_human + 1:], dst[last_human + 1:], strict=True):
                         if isinstance(m, AIMessage) and isinstance(d, dict) and d.get("role") == "assistant":
                             rc = m.additional_kwargs.get("reasoning_content")
                             if rc:

@@ -62,7 +62,9 @@ def _safe_eval(node: ast.AST):
 def build_basic_tools() -> list[BaseTool]:
     @tool
     def get_current_time(
-        timezone: Annotated[str, Field(description="IANA 时区名，如 Asia/Shanghai、America/New_York；留空表示本机时区")] = "",
+        timezone: Annotated[
+            str, Field(description="IANA 时区名，如 Asia/Shanghai、America/New_York；留空表示本机时区")
+        ] = "",
     ) -> str:
         """获取当前日期、时间和星期。涉及“今天/现在/几号/星期几”等问题时使用。"""
         if timezone:
@@ -78,7 +80,7 @@ def build_basic_tools() -> list[BaseTool]:
     def calculator(
         expression: Annotated[str, Field(description="数学表达式，如 (3+5)*2、sqrt(16)、2**10、log(100, 10)")],
     ) -> str:
-        """精确计算数学表达式。支持 + - * / // % **、括号、常量 pi/e，以及 sqrt/sin/cos/log/exp/abs/round/min/max/factorial 等函数。"""
+        """精确计算数学表达式。支持 + - * / // % **、括号、常量 pi/e，以及 sqrt/sin/cos/log/exp/abs/round/min/max/factorial 等函数。"""  # noqa: E501 —— 工具描述会原样发给模型，不折行
         try:
             tree = ast.parse(expression.replace("^", "**"), mode="eval")
             result = _safe_eval(tree)

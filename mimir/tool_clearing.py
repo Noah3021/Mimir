@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 
@@ -48,9 +48,11 @@ def clear_boundary(messages: Sequence[BaseMessage], keep_turns: int) -> int:
     return humans[-keep_turns]
 
 
-def clear_old_tool_outputs(messages: Sequence[BaseMessage], boundary: int, *, min_chars: int = 500) -> list[BaseMessage]:
-    """返回新列表：messages[:boundary] 中内容长度 > min_chars 的 ToolMessage 换成占位副本，其余消息原样保留（同一对象）。
-    不得修改传入的消息对象。"""
+def clear_old_tool_outputs(
+    messages: Sequence[BaseMessage], boundary: int, *, min_chars: int = 500
+) -> list[BaseMessage]:
+    """返回新列表：messages[:boundary] 中内容长度 > min_chars 的 ToolMessage 换成占位副本，
+    其余消息原样保留（同一对象）。不得修改传入的消息对象。"""
     boundary = max(0, min(boundary, len(messages)))
     result: list[BaseMessage] = []
     for i, m in enumerate(messages):
@@ -67,6 +69,6 @@ def cleared_chars(before: Sequence[BaseMessage], after: Sequence[BaseMessage]) -
     """返回清理净减少的字符数（原内容长度 - 占位长度，按位置逐条比较），用于日志记录。"""
     return sum(
         _content_len(b.content) - _content_len(a.content)
-        for b, a in zip(before, after)
+        for b, a in zip(before, after, strict=False)  # 只用于日志，长度不一致时按较短的算，不报错
         if b is not a
     )

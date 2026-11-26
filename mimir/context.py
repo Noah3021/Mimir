@@ -12,7 +12,8 @@ from __future__ import annotations
 import bisect
 import json
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any
+from collections.abc import Callable, Sequence
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 

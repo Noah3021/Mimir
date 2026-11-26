@@ -156,7 +156,9 @@ class AgentRuntime:
         _, text, truncated = read_project_file(self.settings.tools.workspace, p.file, p.max_chars)
         if (text, truncated) == known:
             return None
-        logger.info("项目说明 %s 在会话中途%s，本轮附带最新内容（%d 字）", p.file, "被修改" if text else "被删除", len(text))
+        logger.info(
+            "项目说明 %s 在会话中途%s，本轮附带最新内容（%d 字）", p.file, "被修改" if text else "被删除", len(text)
+        )
         return {"file": p.file, "text": text, "truncated": truncated}
 
     # ---------- 会话 ----------

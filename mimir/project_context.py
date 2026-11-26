@@ -17,7 +17,8 @@ import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
+from collections.abc import Sequence
 
 from langchain_core.messages import BaseMessage, HumanMessage
 
@@ -39,7 +40,7 @@ class ProjectContext:
     project_truncated: bool = False
     git: str = ""                      # git 状态文本；不是 git 仓库或未启用时为空
 
-    def with_update(self, update: dict | None) -> "ProjectContext":
+    def with_update(self, update: dict | None) -> ProjectContext:
         """用一次“项目说明已更新”记录替换其中的项目说明（压缩掉更新提醒后，开头的快照改用最新内容）。"""
         if not update:
             return self
@@ -63,7 +64,10 @@ class ProjectContext:
         if not parts:
             return ""
         body = "\n\n".join(parts)
-        return f"<project-context>\n以下是会话开始时自动收集的项目信息，不是用户在这一轮发送的消息。\n\n{body}\n</project-context>"
+        return (
+            "<project-context>\n以下是会话开始时自动收集的项目信息，不是用户在这一轮发送的消息。\n\n"
+            f"{body}\n</project-context>"
+        )
 
 
 def render_update(update: dict) -> str:

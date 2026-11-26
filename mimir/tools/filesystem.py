@@ -90,7 +90,7 @@ def build_filesystem_tools(cfg: ToolsConfig) -> list[BaseTool]:
             else:
                 lines.append(f"[F] {e.name}  {_human_size(st.st_size)}  {mtime}")
         if len(entries) > 300:
-            lines.append(f"...（仅显示前 300 项）")
+            lines.append("...（仅显示前 300 项）")
         return _truncate("\n".join(lines), limit)
 
     @tool

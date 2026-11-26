@@ -1,7 +1,7 @@
 """危险操作的人工确认策略。"""
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
 
 class ApprovalPolicy:
