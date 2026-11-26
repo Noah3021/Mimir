@@ -1,0 +1,9 @@
+# 每周检查 GitHub Actions（checkout / setup-python 等）有没有新版本，有就提 PR。
+# Python 依赖不交给 Dependabot：由 CI 的 test-latest 任务每周用最新版本测试，
+# 通过后按 constraints.txt 开头的说明手动更新锁定版本。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

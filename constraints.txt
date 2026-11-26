@@ -1,0 +1,43 @@
+# CI 用的锁定版本（pip 的 constraints 文件：只限定版本，不会额外安装包）。
+#
+# 用法：pip install -r requirements-dev.txt -c constraints.txt
+#
+# 锁定范围：requirements*.txt 里的直接依赖，加上 LangChain / LangGraph 生态里迭代快、容易出现
+# 不兼容改动的间接依赖（langchain-core、langgraph-*、openai、anthropic、pydantic）。
+# 其他通用的间接依赖（httpx、certifi 等）不锁，避免某个版本不支持 Python 3.10 或某个系统时装不上。
+#
+# 更新：CI 的 test-latest 任务（每周一定时 / 手动触发）用最新版本跑测试，通过后：
+#   1. 新建虚拟环境，pip install --upgrade -r requirements-dev.txt
+#   2. pip freeze，把下面这些包的版本改成新的
+#   3. 本地和 CI 都通过后提交
+#
+# 生成于 2026-11-26（Windows / Python 3.13 实测通过）。
+
+# ---- 直接依赖（requirements.txt）----
+langchain-core==1.8.5
+langchain-openai==1.8.5
+langchain-deepseek==1.2.1
+langchain-anthropic==1.7.13
+langgraph==1.2.24
+langgraph-checkpoint-sqlite==3.1.3
+python-dotenv==1.2.4
+PyYAML==6.0.4
+rich==15.0.0
+prompt_toolkit==3.0.53
+tzdata==2026.6
+
+# ---- 开发依赖（requirements-dev.txt）----
+pytest==9.2.0
+pytest-cov==7.1.0
+pytest-timeout==2.4.0
+ruff==0.17.6
+
+# ---- 迭代快的间接依赖 ----
+langgraph-checkpoint==4.3.2
+langgraph-prebuilt==1.1.3
+langgraph-sdk==0.4.14
+langsmith==0.16.2
+openai==3.59.0
+anthropic==2.14.0
+pydantic==2.14.4
+pydantic_core==2.50.5

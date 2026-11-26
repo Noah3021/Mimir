@@ -5,6 +5,8 @@ testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-ra"
 xfail_strict = true
+# 单个测试超过 60 秒判为失败（graph 涉及 interrupt / 重试，万一卡死不至于空跑到 CI 超时）
+timeout = 60
 
 [tool.coverage.run]
 source = ["mimir"]

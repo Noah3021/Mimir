@@ -3,25 +3,40 @@ name: CI
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "0 1 * * 1"   # 每周一 01:00 UTC（北京时间 09:00），用最新依赖跑一遍
+  workflow_dispatch:
+
+# 只读权限：CI 只需要拉代码
+permissions:
+  contents: read
+
+# 同一分支 / PR 有新的提交时，取消还在跑的旧任务
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install "ruff>=0.6"
+      - run: pip install -c constraints.txt ruff
       - run: ruff check . --output-format=github
 
   test:
+    # 按 constraints.txt 锁定的版本安装：上游发新版本不会让 CI 突然变红
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python: ["3.10", "3.12"]
+        python: ["3.10", "3.11", "3.12", "3.13"]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,5 +46,25 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             requirements-dev.txt
-      - run: pip install -r requirements-dev.txt
+            constraints.txt
+      - run: pip install -r requirements-dev.txt -c constraints.txt
       - run: python -m pytest --cov --cov-report=term
+
+  test-latest:
+    # 不锁版本，安装各依赖的最新版。只在每周定时和手动触发时运行，用来提前发现上游的不兼容改动；
+    # 通过后可以按 constraints.txt 开头的说明更新锁定版本。
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install --upgrade -r requirements-dev.txt
+      - run: pip freeze
+      - run: python -m pytest
