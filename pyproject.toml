@@ -6,6 +6,17 @@ pythonpath = ["."]
 addopts = "-ra"
 xfail_strict = true
 
+[tool.coverage.run]
+source = ["mimir"]
+# python -m mimir 的入口只有几行，由冒烟测试在子进程里覆盖，这里统计不到
+omit = ["mimir/__main__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+# 底线只升不降：2026-11-26 实测 88%，留 3 个点给不同系统 / Python 版本之间的差异
+fail_under = 85
+
 [tool.ruff]
 line-length = 120
 target-version = "py310"
