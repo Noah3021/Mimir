@@ -1,0 +1,59 @@
+name: Release
+
+# 推送 v* 标签时：检查标签和代码里的版本号一致，构建 wheel 和源码包，在干净环境里装一遍确认能用，
+# 然后创建 GitHub Release 并上传安装包。
+#
+# 发版流程：
+#   1. 改 mimir/__init__.py 里的 __version__，提交并推送到 main
+#   2. 二选一：
+#      - git tag v0.3.0 && git push origin v0.3.0
+#        Release 的说明由 GitHub 按提交记录自动生成，之后可以在网页上修改
+#      - gh release create v0.3.0 --target main --title "Mimir v0.3.0" --notes-file notes.md
+#        先用自己写的说明创建 Release（同时创建标签），本工作流只往里上传安装包
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # 创建 Release、上传附件
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: 检查标签与版本号一致
+        run: |
+          version=$(python -c "import mimir; print(mimir.__version__)")
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::标签 $TAG 和 mimir/__init__.py 里的版本号 $version 不一致，先改版本号再打标签"
+            exit 1
+          fi
+
+      - run: pip install build
+      - run: python -m build --outdir dist   # wheel + 源码包
+
+      - name: 在干净环境中安装并运行
+        env:
+          MIMIR_HOME: ${{ runner.temp }}/mimir-home
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install dist/*.whl -c constraints.txt
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/venv/bin/mimir" --version | grep -qF "${TAG#v}"
+
+      - name: 创建 Release 并上传安装包
+        run: |
+          # 已经用 gh release create 手动建好（带自己写的说明）时只上传附件；否则自动生成说明
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "Mimir $TAG" --generate-notes
+          fi
+          gh release upload "$TAG" dist/* --clobber

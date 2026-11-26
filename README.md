@@ -11,7 +11,7 @@ pipx install git+https://github.com/Noah3021/Mimir
 # 或：uv tool install git+https://github.com/Noah3021/Mimir
 ```
 
-安装指定版本：在地址后加 `@v0.3.0` 这样的标签。升级：`pipx upgrade mimir-agent`。
+安装指定版本：在地址后加标签，例如 `pipx install git+https://github.com/Noah3021/Mimir@v0.2.0`，可用的版本见 [Releases](https://github.com/Noah3021/Mimir/releases)。也可以从 Releases 页面下载 `.whl` 文件，再用 `pipx install <文件名>.whl` 安装。升级：`pipx upgrade mimir-agent`。
 
 ## 第一次使用
 
