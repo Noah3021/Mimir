@@ -15,6 +15,7 @@ from rich.console import Console, Group
 from rich.live import Live
 from rich.segment import Segment
 from rich.markdown import Markdown
+from rich.cells import cell_len
 from rich.markup import escape
 from rich.padding import Padding
 from rich.panel import Panel
@@ -137,6 +138,50 @@ class _Tail:
             yield Segment.line()
 
 
+def stream_renderable(mode: str, buf: str) -> Any:
+    """一段流式内容的显示：思考过程（标题 + 缩进的灰色斜体）或正文（● + Markdown）。"""
+    if mode == "reasoning":
+        return Group(Text("✻ 思考过程", style="dim bold"),
+                     Padding(Text(buf.strip(), style="dim italic"), (0, 0, 0, 2)))
+    return bullet(Markdown(buf.strip()))
+
+
+# 启动画面左侧的大号字母（ANSI Shadow 字体），从上到下 cyan → blue 渐变
+LOGO = (
+    "███╗   ███╗██╗███╗   ███╗██╗██████╗ ",
+    "████╗ ████║██║████╗ ████║██║██╔══██╗",
+    "██╔████╔██║██║██╔████╔██║██║██████╔╝",
+    "██║╚██╔╝██║██║██║╚██╔╝██║██║██╔══██╗",
+    "██║ ╚═╝ ██║██║██║ ╚═╝ ██║██║██║  ██║",
+    "╚═╝     ╚═╝╚═╝╚═╝     ╚═╝╚═╝╚═╝  ╚═╝",
+)
+LOGO_COLORS = ("#00d7ff", "#00c3ff", "#00afff", "#009bff", "#0087ff", "#0073ff")
+LOGO_GAP = 3
+
+
+def banner_renderable(name: str, version: str, model: str, reasoning: str, workspace: str,
+                      *, width: int, unicode: bool = True) -> Any:
+    """启动画面：左边大号字母，右边三行（名字和版本、模型和推理强度、工作目录）。
+
+    终端太窄或者编码不是 UTF-8 时只显示右边的三行。
+    """
+    info = Text.assemble((name, "bold"), (f" v{version}", "dim"), "\n",
+                         model, (f" · 推理 {reasoning}", "dim"), "\n",
+                         (workspace, "dim"))
+    info_width = max(cell_len(line) for line in info.plain.split("\n"))
+    logo_width = max(cell_len(line) for line in LOGO)
+    if not unicode or width < logo_width + LOGO_GAP + info_width:
+        return info
+    logo = Text()
+    for i, (line, color) in enumerate(zip(LOGO, LOGO_COLORS, strict=True)):
+        logo.append(("\n" if i else "") + line, style=f"bold {color}")
+    grid = Table.grid(padding=(0, LOGO_GAP))
+    grid.add_column(no_wrap=True)
+    grid.add_column(vertical="middle", no_wrap=True)
+    grid.add_row(logo, info)
+    return grid
+
+
 class StreamPrinter:
     """管理流式输出：等待动画 / 推理过程 / 正文（Markdown 实时渲染）。
 
@@ -171,10 +216,8 @@ class StreamPrinter:
         self.live.update(_Tail(self._render()))
 
     def _render(self):
-        if self.mode == "reasoning":  # 标题放在 Live 内，重试丢弃时一并清除
-            return Group(Text("✻ 思考过程", style="dim bold"),
-                         Padding(Text(self.buf.strip(), style="dim italic"), (0, 0, 0, 2)))
-        return bullet(Markdown(self.buf.strip()))
+        # 思考过程的标题也放在 Live 内，重试丢弃时一并清除
+        return stream_renderable(self.mode or "text", self.buf)
 
     def discard(self) -> None:
         """丢弃当前流式区域的内容（不打印），用于请求中断后重试。"""
@@ -219,9 +262,7 @@ class AgentCLI:
             from prompt_toolkit.key_binding import KeyBindings
             from prompt_toolkit.styles import Style
 
-            words = [c.split()[0] for c, _ in COMMANDS] + ["/quit", "/approve on", "/approve off"]
-            words += [f"/model {n}" for n in self.settings.models]
-            words += [f"/think {lv}" for lv in REASONING_LEVELS]
+            words = self.completion_words()
             kb = KeyBindings()
 
             @kb.add("escape", "enter")  # Esc+Enter（或 Alt+Enter）换行
@@ -254,6 +295,12 @@ class AgentCLI:
             logger.warning("prompt_toolkit 不可用，改用简单输入：%s", e)
             return None
 
+    def completion_words(self) -> list[str]:
+        words = [c.split()[0] for c, _ in COMMANDS] + ["/quit", "/approve on", "/approve off"]
+        words += [f"/model {n}" for n in self.settings.models]
+        words += [f"/think {lv}" for lv in REASONING_LEVELS]
+        return words
+
     @staticmethod
     def _pt_width() -> int:
         from prompt_toolkit.application import get_app
@@ -274,15 +321,20 @@ class AgentCLI:
             ("class:hint", "  /help 查看命令 · Esc+Enter 换行 · Ctrl+C 中断回答"),
         ]
 
-    def _context_ratio(self) -> float | None:
-        """最近一次模型调用的 输入 + 输出 token 占上下文窗口的比例，还没调用过时为 None。"""
+    def context_usage(self) -> tuple[int, int] | None:
+        """(最近一次模型调用的 输入 + 输出 token, 上下文窗口)，还没调用过时为 None。"""
         window = self.rt.model_config.context_window or self.settings.agent.context.window
         for m in reversed(self.rt.messages()):
             um = getattr(m, "usage_metadata", None) if isinstance(m, AIMessage) else None
             if um:
                 used = int(um.get("input_tokens") or 0) + int(um.get("output_tokens") or 0)
-                return used / window if window else None
+                return (used, window) if window else None
         return None
+
+    def _context_ratio(self) -> float | None:
+        """最近一次模型调用的 输入 + 输出 token 占上下文窗口的比例，还没调用过时为 None。"""
+        usage = self.context_usage()
+        return usage[0] / usage[1] if usage else None
 
     def status_line(self) -> str:
         parts = [self.rt.model_config.model, f"推理 {self.rt.reasoning_level}",
@@ -312,18 +364,35 @@ class AgentCLI:
         return self.console.input("[bold cyan]› [/]")
 
     # ---------- 主循环 ----------
-    def banner(self) -> None:
-        info = Text.assemble(
-            ("✻ ", "bold cyan"), (self.settings.agent.name, "bold"), (f" v{__version__}", "dim"), "\n\n",
-            self.rt.model_config.model, (f" · 推理 {self.rt.reasoning_level}", "dim"), "\n",
-            (short_path(self.settings.tools.workspace), "dim"),
-        )
-        self.console.print(Panel(info, border_style="cyan", expand=False, padding=(0, 2)))
-        if self.session is None:  # 没有状态栏时，把提示放在这里
-            self.console.print(Text("  /help 查看命令 · Ctrl+C 中断回答", style="dim"))
-        self.console.print()
+    def banner(self, hint: str | None = None) -> None:
+        c = self.console
+        c.print()
+        c.print(banner_renderable(
+            self.settings.agent.name, __version__, self.rt.model_config.model, self.rt.reasoning_level,
+            short_path(self.settings.tools.workspace),
+            width=c.width, unicode=(c.encoding or "").lower().replace("-", "").startswith("utf"),
+        ))
+        if hint is None and self.session is None:  # 没有状态栏时，把提示放在这里
+            hint = "/help 查看命令 · Ctrl+C 中断回答"
+        if hint:
+            c.print()
+            c.print(Text(hint, style="dim"))
+        c.print()
 
     def loop(self) -> None:
+        if self.session is not None:  # 能用 prompt_toolkit 时，用输入框固定在底部的界面
+            try:
+                from .tui import FixedInputUI
+                ui = FixedInputUI(self)
+            except Exception as e:
+                logger.warning("无法启动新界面，改用逐行输入：%s", e)
+            else:
+                ui.run()
+                return
+        self.classic_loop()
+
+    def classic_loop(self) -> None:
+        """逐行输入：等待输入时才显示输入框，回答期间输出直接追加到终端。"""
         self.banner()
         while True:
             try:
