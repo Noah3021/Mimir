@@ -252,6 +252,7 @@ class AgentCLI:
         self.listing: list = []  # 最近一次 /sessions 的结果，用于按序号恢复
         self._status = ""  # 输入框下方的状态栏，每次等待输入前刷新
         self._runner: TurnRunner | None = None  # 正在执行的一轮对话
+        self.approver = self._ask_approval  # 危险操作确认；新界面运行时换成底部的选择框
         self.session = self._make_prompt_session()
 
     # ---------- 输入 ----------
@@ -425,7 +426,7 @@ class AgentCLI:
     def run_turn(self, user_input: str) -> None:
         """执行一轮对话。执行逻辑在 TurnRunner 里，这里只负责显示它发出的事件。"""
         self.console.print()
-        self._runner = TurnRunner(self.rt, self.on_event, self._ask_approval, streaming=self.settings.cli.stream)
+        self._runner = TurnRunner(self.rt, self.on_event, self.approver, streaming=self.settings.cli.stream)
         try:
             self._runner.run(user_input)
         finally:
@@ -522,11 +523,15 @@ class AgentCLI:
             return Group(Text(title, style="bold"), diff)
         return Text(clip_lines(json.dumps(args, ensure_ascii=False, indent=2, default=str)))
 
+    def approval_panel(self, value: dict) -> Panel:
+        """需要确认的操作详情：命令、要写入的内容或修改的 diff。"""
+        tool = value.get("tool", "?")
+        return Panel(self._format_args(tool, value.get("args") or {}),
+                     title=f"[bold yellow]需要确认：{escape(tool)}[/]", border_style="yellow")
+
     def _ask_approval(self, value: dict) -> tuple[dict, bool]:
         self.printer.end()
-        tool = value.get("tool", "?")
-        self.console.print(Panel(self._format_args(tool, value.get("args") or {}),
-                                 title=f"[bold yellow]需要确认：{escape(tool)}[/]", border_style="yellow"))
+        self.console.print(self.approval_panel(value))
         hint = "[yellow]是否允许？[/] y=允许  n=拒绝  a=本次运行始终允许该工具  其他内容=拒绝并反馈给助手 › "
         while True:
             ans = self.console.input(hint).strip()

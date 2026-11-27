@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import re
 import threading
+import time
 
 import pytest
 from prompt_toolkit.data_structures import Size
@@ -228,13 +229,112 @@ def test_escape_interrupts_turn(cli, model):
     assert "已中断本轮回答" in text
 
 
-def test_approval_prompt_in_terminal(cli, model, workspace, monkeypatch):
-    model.script = [tool_call("write_file", {"path": "a.txt", "content": "hi"}), "写好了"]
-    monkeypatch.setattr(cli.console, "input", lambda prompt="", **kw: "y")
-    text = drive(cli, send("写个文件", 1))
+# ---------------- 危险操作确认 ----------------
+WRITE = tool_call("write_file", {"path": "a.txt", "content": "hi"})
+
+
+def wait_for(cond, timeout=10) -> bool:
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def answer_approval(keys, wait_done=True):
+    """发一条会触发确认的消息，等底部出现选择框后按下 keys。"""
+    def step(ui, pipe):
+        pipe.send_text("写个文件\r")
+        assert wait_for(lambda: ui.approval is not None), "没有出现确认框"
+        if keys:
+            pipe.send_text(keys)
+        if wait_done:
+            assert ui.wait_idle(1)
+    return step
+
+
+@pytest.mark.parametrize("keys", ["1", "\r"])  # 回车 = 选中的第一项“允许”
+def test_approval_allow(cli, model, workspace, keys):
+    model.script = [WRITE, "写好了"]
+    text = drive(cli, answer_approval(keys))
     assert (workspace / "a.txt").read_text(encoding="utf-8") == "hi"
-    assert "需要确认：write_file" in text
+    assert "需要确认：write_file" in text  # 详情打印在消息区
+    assert "└ 已允许" in text
     assert "写好了" in text
+    assert "write_file" not in cli.rt.approval.session_allowed
+
+
+def test_approval_always(cli, model):
+    model.script = [WRITE, "ok"]
+    text = drive(cli, answer_approval("2"))
+    assert "本次运行不再询问 write_file" in text
+    assert "write_file" in cli.rt.approval.session_allowed
+
+
+def test_approval_reject_with_arrow_keys(cli, model, workspace):
+    model.script = [WRITE, "好的"]
+    text = drive(cli, answer_approval("\x1b[B\x1b[B\x1b[B\x1b[A\r"))  # 下 3 次回到第 1 项，再上 1 次绕到最后的“拒绝”
+    assert not (workspace / "a.txt").exists()
+    assert "└ 已拒绝" in text
+
+
+def test_approval_feedback(cli, model, workspace):
+    model.script = [WRITE, "好的，不写了"]
+    text = drive(cli, answer_approval("别写这个文件\r"))
+    assert not (workspace / "a.txt").exists()
+    assert "已拒绝，反馈：别写这个文件" in text
+    assert "别写这个文件" in str(model.calls[-1][-1].content)
+
+
+def test_approval_escape_interrupts(cli, model, workspace):
+    model.script = [WRITE]
+    text = drive(cli, answer_approval("\x1b"))
+    assert not (workspace / "a.txt").exists()
+    assert "└ 已中断" in text and "已中断本轮回答" in text
+    assert len(model.calls) == 1
+
+
+def test_approval_keeps_draft(cli, model):
+    """确认框出现前输入框里没发出去的内容，确认完要还回来，不能被当成反馈。"""
+    gate = threading.Event()
+
+    def slow(messages):
+        gate.wait(10)
+        return WRITE
+
+    model.script = [slow, "写好了"]
+    seen = {}
+
+    def step(ui, pipe):
+        pipe.send_text("写个文件\r")
+        pipe.send_text("草稿")
+        assert wait_for(lambda: ui.buffer.text == "草稿")
+        gate.set()
+        assert wait_for(lambda: ui.approval is not None)
+        assert ui.buffer.text == ""
+        pipe.send_text("1")
+        assert ui.wait_idle(1)
+        seen["draft"] = ui.buffer.text
+
+    text = drive(cli, step)
+    assert seen["draft"] == "草稿"
+    assert "└ 已允许" in text
+
+
+def test_approval_letters_go_to_feedback(cli, model, workspace):
+    """英文反馈的首字母不能被当成快捷键：a 开头的反馈不能变成“始终允许”。"""
+    model.script = [WRITE, "好的"]
+    text = drive(cli, answer_approval("actually no\r"))
+    assert not (workspace / "a.txt").exists()
+    assert "已拒绝，反馈：actually no" in text
+    assert "write_file" not in cli.rt.approval.session_allowed
+
+
+def test_exit_while_waiting_for_approval(cli, model, workspace):
+    model.script = [WRITE]
+    drive(cli, answer_approval("", wait_done=False))  # 确认框出现后直接退出界面
+    assert not (workspace / "a.txt").exists()
 
 
 def test_exit_word_quits(cli):

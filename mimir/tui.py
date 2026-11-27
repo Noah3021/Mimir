@@ -3,7 +3,8 @@
 画面分两块：
 - 上面是固定区：说完的内容（用户消息、回答、工具调用、命令输出）打印成普通的终端输出，之后不再改动，
   终端自带的滚动和复制都能用。打印时先擦掉底部的界面，打印完再重画（prompt_toolkit 的 run_in_terminal）。
-- 下面是动态区：正在流式输出的内容、等待动画和状态、排队的消息、输入框、底部状态栏，一直在原地刷新。
+- 下面是动态区：正在流式输出的内容、等待动画和状态（或危险操作确认的选择框）、排队的消息、输入框、
+  底部状态栏，一直在原地刷新。
   界面不是全屏的：它从光标位置一直铺到终端底部，顶部用一块空白把输入框压在最下面。
 
 线程：
@@ -28,6 +29,7 @@ from typing import Any
 from prompt_toolkit.application import Application, run_in_terminal
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI, StyleAndTextTuples
 from prompt_toolkit.history import InMemoryHistory
@@ -66,7 +68,18 @@ STYLE = Style.from_dict({
     "ctx-high": "ansired",
     "ctx-empty": "#444444",
     "cache": "#5fafaf",
+    "approval-title": "bold ansiyellow",
+    "choice": "#bcbcbc",
+    "choice-selected": "bold #00afff",
 })
+
+# 危险操作确认的选项：(显示文字, 是否允许, 是否本次运行始终允许该工具)
+APPROVAL_CHOICES = (
+    ("允许", True, False),
+    ("本次运行始终允许 {tool}", True, True),
+    ("拒绝", False, False),
+)
+APPROVAL_HEIGHT = len(APPROVAL_CHOICES) + 2  # 标题 + 选项 + 按键提示
 
 
 def context_bar(usage: tuple[int, int] | None, width: int = 20) -> StyleAndTextTuples:
@@ -98,6 +111,25 @@ def cache_text(last: Usage | None) -> StyleAndTextTuples:
 
 # 底部状态栏的数据：(审批是否开启, (上下文已用, 窗口), 最近一次调用的用量)
 FooterState = tuple[bool, "tuple[int, int] | None", "Usage | None"]
+
+
+class _Approval:
+    """底部正在等待的一次危险操作确认。future 的结果是 (决定, 是否始终允许)，由后台线程等待。"""
+
+    __slots__ = ("tool", "future", "selected")
+
+    def __init__(self, tool: str, future: concurrent.futures.Future):
+        self.tool, self.future, self.selected = tool, future, 0
+
+
+def approval_result_text(decision: dict, always: bool, tool: str, interrupted: bool = False) -> Text:
+    """确认结果，接在确认详情下面打印到消息区。"""
+    if interrupted:
+        return Text("  └ 已中断", style="yellow")
+    if decision.get("approved"):
+        return Text("  └ 已允许" + (f"（本次运行不再询问 {tool}）" if always else ""), style="green")
+    feedback = decision.get("feedback")
+    return Text("  └ 已拒绝" + (f"，反馈：{feedback}" if feedback else ""), style="red")
 
 
 class _Segment:
@@ -202,6 +234,8 @@ class FixedInputUI:
         self.current: _Segment | None = None  # 正在流式输出的一段
         self.flushing: list[_Segment] = []  # 已经说完、正在打印到上方的段落（打印完之前仍显示在动态区）
         self.pending: deque[str] = deque()  # 排队等待处理的输入
+        self.approval: _Approval | None = None  # 正在等待的危险操作确认
+        self._stash: Document | None = None  # 确认期间输入框用来写反馈，原来没发出去的内容先存起来
         self.status = THINKING
         self.running = False
         self.exiting = False
@@ -255,11 +289,13 @@ class FixedInputUI:
         self.cli.console = _TuiConsole(self, force_terminal=True, color_system=self.color_system,
                                        legacy_windows=False)
         self.cli.printer = DynamicPrinter(self, self.cli.settings.cli.show_reasoning)
+        old_approver, self.cli.approver = self.cli.approver, self.ask_approval
         try:
             self.app.run(pre_run=self._pre_run)
         finally:
             self.loop = None
             self.cli.console, self.cli.printer = self.real_console, old_printer
+            self.cli.approver = old_approver
             for f in list(self._waiting):
                 if not f.done():
                     f.set_exception(EOFError("界面已退出"))
@@ -385,7 +421,8 @@ class FixedInputUI:
                 seg._key = key
             lines.extend(seg._lines)
         # 动态区不能超过一屏，否则顶部滚出屏幕后无法擦除
-        limit = max(3, rows - 6 - len(self.pending) - self.buffer.document.line_count)
+        extra = APPROVAL_HEIGHT if self.approval is not None else 0
+        limit = max(3, rows - 6 - len(self.pending) - self.buffer.document.line_count - extra)
         return lines[-limit:]
 
     # ====================== 布局 ======================
@@ -398,8 +435,10 @@ class FixedInputUI:
                        height=lambda: Dimension.exact(len(self._stream_lines())), wrap_lines=False),
                 filter=Condition(lambda: bool(self._stream_lines())),
             ),
+            ConditionalContainer(Window(FormattedTextControl(self._approval_fragments), height=APPROVAL_HEIGHT),
+                                 filter=Condition(lambda: self.approval is not None)),
             ConditionalContainer(Window(FormattedTextControl(self._status_fragments), height=1),
-                                 filter=Condition(lambda: self.running or self.exiting)),
+                                 filter=Condition(lambda: (self.running or self.exiting) and self.approval is None)),
             ConditionalContainer(Window(FormattedTextControl(self._queued_fragments),
                                         height=lambda: Dimension.exact(len(self.pending))),
                                  filter=Condition(lambda: bool(self.pending))),
@@ -419,6 +458,19 @@ class FixedInputUI:
         frame = SPINNER[int(now * 8) % len(SPINNER)]
         return [("class:spinner", f"{frame} "), ("class:status", self.status),
                 ("class:dim", f"  ({int(now - self.turn_started)}s · Esc 中断)")]
+
+    def _approval_fragments(self) -> StyleAndTextTuples:
+        ap = self.approval
+        if ap is None:
+            return []
+        out: StyleAndTextTuples = [("class:approval-title", f"  ⚠ 需要确认：{ap.tool}"),
+                                   ("class:dim", "（详情见上方）\n")]
+        for i, (label, _, _) in enumerate(APPROVAL_CHOICES):
+            sel = i == ap.selected
+            out.append(("class:choice-selected" if sel else "class:choice",
+                        f"  {'❯' if sel else ' '} {i + 1}. {label.format(tool=ap.tool)}\n"))
+        out.append(("class:dim", "  ↑↓ 选择 · Enter 确认 · 输入内容后回车 = 拒绝并反馈 · Esc 拒绝并中断"))
+        return out
 
     def _queued_fragments(self) -> StyleAndTextTuples:
         width = self.term_size()[0]
@@ -457,13 +509,17 @@ class FixedInputUI:
         def _(event):
             if self.buffer.complete_state:
                 self.buffer.cancel_completion()
+            elif self.approval is not None:
+                self.reject_and_interrupt()
             elif self.running:
                 self.interrupt()
 
         @kb.add("c-c")
         def _(event):
             now = time.monotonic()
-            if self.running:
+            if self.approval is not None:
+                self.reject_and_interrupt()
+            elif self.running:
                 self.interrupt()
             elif self.buffer.text:
                 self.buffer.reset()
@@ -478,11 +534,33 @@ class FixedInputUI:
             if not self.buffer.text:
                 self.request_exit()
 
+        # 危险操作确认：方向键选择；输入框为空时 1/2/3 直接选。
+        # 不用 y/a/n：会和英文反馈的首字母冲突（输入 "actually…" 时第一个 a 就成了“始终允许”）
+        approving = Condition(lambda: self.approval is not None)
+        empty = Condition(lambda: not self.buffer.text)
+
+        @kb.add("up", filter=approving, eager=True)
+        def _(event):
+            self.move_choice(-1)
+
+        @kb.add("down", filter=approving, eager=True)
+        def _(event):
+            self.move_choice(1)
+
+        for key, idx in (("1", 0), ("2", 1), ("3", 2)):
+            kb.add(key, filter=approving & empty, eager=True)(lambda event, idx=idx: self.choose(idx))
+
         kb.add("tab")(generate_completions)
         return kb
 
     def submit(self) -> None:
         line = self.buffer.text.strip()
+        if self.approval is not None:  # 确认期间：有输入就是拒绝并反馈，没有就选当前选项
+            if line:
+                self.resolve_approval({"approved": False, "feedback": line})
+            else:
+                self.choose(self.approval.selected)
+            return
         if not line:
             return
         self.buffer.reset(append_to_history=True)
@@ -506,7 +584,7 @@ class FixedInputUI:
         if self.exiting:
             return
         self.exiting = True
-        self.interrupt()
+        self.reject_and_interrupt() if self.approval is not None else self.interrupt()
         self.pending.clear()
         while True:
             try:
@@ -535,6 +613,62 @@ class FixedInputUI:
         """等到至少提交了 submitted 条输入、并且都处理完。测试用。"""
         with self._cv:
             return self._cv.wait_for(lambda: self._submitted >= submitted and self._outstanding == 0, timeout)
+
+    # ====================== 危险操作确认 ======================
+    def ask_approval(self, value: dict) -> tuple[dict, bool]:
+        """（后台线程）TurnRunner 的确认回调：详情打印到消息区，底部显示选择框，等用户选完。"""
+        cli = self.cli
+        tool = str(value.get("tool", "?"))
+        cli.printer.end()
+        cli.console.print(cli.approval_panel(value))
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+        self._waiting.add(fut)
+        try:
+            if self.loop is None:  # 界面已退出
+                raise EOFError
+            self.call(lambda: self._open_approval(tool, fut))
+            decision, always = fut.result()
+        except EOFError:
+            decision, always = {"approved": False}, False
+        finally:
+            self._waiting.discard(fut)
+        runner = cli._runner
+        cli.console.print(approval_result_text(decision, always, tool,
+                                               interrupted=runner is not None and runner.cancelled))
+        return decision, always
+
+    def _open_approval(self, tool: str, fut: concurrent.futures.Future) -> None:
+        if self.exiting:  # 正在退出：不再询问，直接拒绝
+            fut.set_result(({"approved": False}, False))
+            return
+        self._stash, self.approval = self.buffer.document, _Approval(tool, fut)
+        self.buffer.reset()
+        if self.buffer.complete_state:
+            self.buffer.cancel_completion()
+
+    def move_choice(self, step: int) -> None:
+        if self.approval is not None:
+            self.approval.selected = (self.approval.selected + step) % len(APPROVAL_CHOICES)
+
+    def choose(self, idx: int) -> None:
+        _, approved, always = APPROVAL_CHOICES[idx]
+        self.resolve_approval({"approved": approved}, always)
+
+    def resolve_approval(self, decision: dict, always: bool = False) -> None:
+        """（界面线程）关闭选择框，把结果交给等待中的后台线程，恢复输入框里原来的内容。"""
+        ap, self.approval = self.approval, None
+        if ap is None:
+            return
+        self.buffer.document = self._stash or Document()
+        self._stash = None
+        if not ap.future.done():
+            ap.future.set_result((decision, always))
+        self.set_status(THINKING)
+
+    def reject_and_interrupt(self) -> None:
+        """确认时按 Esc / Ctrl+C：拒绝这次操作并中断本轮（先中断，TurnRunner 拿到结果后就不会继续执行）。"""
+        self.interrupt()
+        self.resolve_approval({"approved": False})
 
     # ====================== 后台线程 ======================
     def _work(self) -> None:
