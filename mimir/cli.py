@@ -18,6 +18,7 @@ from rich.live import Live
 from rich.segment import Segment
 from rich.markdown import Markdown
 from rich.markup import escape
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.syntax import Syntax
@@ -64,6 +65,56 @@ def clip_lines(text: str, max_lines: int = 40) -> str:
     if len(lines) <= max_lines:
         return text
     return "\n".join(lines[:max_lines]) + f"\n…（共 {len(lines)} 行，仅显示前 {max_lines} 行）"
+
+
+def short_path(p: Any) -> str:
+    """用户目录下的路径缩写成 ~ 开头，例如 ~\\Desktop\\test。"""
+    p = Path(p)
+    try:
+        rel = p.resolve().relative_to(Path.home().resolve())
+    except (ValueError, OSError):
+        return str(p)
+    return "~" if rel == Path(".") else str(Path("~") / rel)
+
+
+class bullet:  # noqa: N801 —— 用起来像函数：bullet(Markdown(...))
+    """在内容左侧加一个标记，后续行缩进 2 列对齐。
+
+    不用 Table.grid：表格单元格里的 Markdown 列表项会被截断成“…”，不会换行。
+    """
+
+    def __init__(self, renderable: Any, mark: str = "●", style: str = "cyan"):
+        self.renderable, self.mark, self.style = renderable, mark, style
+
+    def __rich_console__(self, console: Console, options):
+        inner = options.update_width(max(options.max_width - 2, 10))
+        lines = console.render_lines(self.renderable, inner, pad=False)
+        while lines and not "".join(s.text for s in lines[-1]).strip():
+            lines.pop()  # 去掉 Markdown 末尾的空行
+        for i, line in enumerate(lines):
+            yield Segment(self.mark + " ", console.get_style(self.style)) if i == 0 else Segment("  ")
+            yield from line
+            yield Segment.line()
+
+
+# 工具调用只显示最能说明意图的那个参数，完整参数在确认框和 /history 里看
+_BRIEF_KEYS = ("command", "path", "pattern", "query", "url", "expression")
+
+
+def tool_call_text(tc: dict) -> Text:
+    """一次工具调用：● run_shell(git status)"""
+    args = tc.get("args") or {}
+    brief = None
+    if isinstance(args, dict):
+        brief = next((str(args[k]) for k in _BRIEF_KEYS if args.get(k) not in (None, "")), None)
+    brief = short(brief if brief is not None else (args or ""))
+    return Text.assemble(("● ", "magenta"), (tc.get("name", "?"), "bold"), ("(", "dim"), brief, (")", "dim"))
+
+
+def tool_result_text(m: ToolMessage, limit: int = 200) -> Text:
+    """工具结果，接在调用下面：  └ 结果摘要（出错时为红色）"""
+    ok = m.status != "error"
+    return Text.assemble(("  └ ", "dim"), (short(message_text(m) or str(m.content), limit), "dim" if ok else "red"))
 
 
 class _Tail:
@@ -121,8 +172,9 @@ class StreamPrinter:
 
     def _render(self):
         if self.mode == "reasoning":  # 标题放在 Live 内，重试丢弃时一并清除
-            return Group(Text("思考过程", style="dim bold"), Text(self.buf.strip(), style="dim italic"))
-        return Markdown(self.buf.strip())
+            return Group(Text("✻ 思考过程", style="dim bold"),
+                         Padding(Text(self.buf.strip(), style="dim italic"), (0, 0, 0, 2)))
+        return bullet(Markdown(self.buf.strip()))
 
     def discard(self) -> None:
         """丢弃当前流式区域的内容（不打印），用于请求中断后重试。"""
@@ -152,15 +204,19 @@ class AgentCLI:
         self.settings: Settings = runtime.settings
         self.printer = StreamPrinter(console, self.settings.cli.show_reasoning)
         self.listing: list = []  # 最近一次 /sessions 的结果，用于按序号恢复
+        self._status = ""  # 输入框下方的状态栏，每次等待输入前刷新
         self.session = self._make_prompt_session()
 
     # ---------- 输入 ----------
     def _make_prompt_session(self):
         try:
             from prompt_toolkit import PromptSession
+            from prompt_toolkit.application import get_app
             from prompt_toolkit.completion import WordCompleter
+            from prompt_toolkit.filters import Condition
             from prompt_toolkit.history import FileHistory
             from prompt_toolkit.key_binding import KeyBindings
+            from prompt_toolkit.styles import Style
 
             words = [c.split()[0] for c, _ in COMMANDS] + ["/quit", "/approve on", "/approve off"]
             words += [f"/model {n}" for n in self.settings.models]
@@ -176,40 +232,95 @@ class AgentCLI:
             if hist:
                 hist.parent.mkdir(parents=True, exist_ok=True)
                 history = FileHistory(str(hist))
+            # 只在输入斜杠命令时边输边补全。补全开启时 prompt_toolkit 会在输入行下方预留菜单的空间，
+            # 一直开着的话，输入行和状态栏之间总隔着几行空白
+            slash = Condition(lambda: get_app().current_buffer.text.startswith("/"))
             return PromptSession(
                 history=history,
                 completer=WordCompleter(words, ignore_case=True, sentence=True),
                 key_bindings=kb,
-                complete_while_typing=True,
+                complete_while_typing=slash,
+                bottom_toolbar=self._toolbar,
+                style=Style.from_dict({
+                    "bottom-toolbar": "noreverse",  # 默认是反色的整条色块
+                    "rule": "#5f5f5f",
+                    "prompt": "bold ansicyan",
+                    "status": "#8a8a8a",
+                    "hint": "#5f5f5f",
+                }),
             )
         except Exception as e:  # 例如 Git Bash(mintty) 中没有 Windows 控制台
             logger.warning("prompt_toolkit 不可用，改用简单输入：%s", e)
             return None
 
+    @staticmethod
+    def _pt_width() -> int:
+        from prompt_toolkit.application import get_app
+        try:
+            return max(get_app().output.get_size().columns, 20)
+        except Exception:
+            return 80
+
+    def _prompt_message(self):
+        """输入行上方一条横线，留在滚动区里正好把每轮对话隔开。"""
+        return [("class:rule", "─" * self._pt_width() + "\n"), ("class:prompt", "› ")]
+
+    def _toolbar(self):
+        """输入行下方：横线 + 状态栏 + 快捷键提示。按回车后自动消失，不留在滚动区。"""
+        return [
+            ("class:rule", "─" * self._pt_width() + "\n"),
+            ("class:status", f"  {self._status}\n"),
+            ("class:hint", "  /help 查看命令 · Esc+Enter 换行 · Ctrl+C 中断回答"),
+        ]
+
+    def _context_ratio(self) -> float | None:
+        """最近一次模型调用的 输入 + 输出 token 占上下文窗口的比例，还没调用过时为 None。"""
+        window = self.rt.model_config.context_window or self.settings.agent.context.window
+        for m in reversed(self.rt.messages()):
+            um = getattr(m, "usage_metadata", None) if isinstance(m, AIMessage) else None
+            if um:
+                used = int(um.get("input_tokens") or 0) + int(um.get("output_tokens") or 0)
+                return used / window if window else None
+        return None
+
+    def status_line(self) -> str:
+        parts = [self.rt.model_config.model, f"推理 {self.rt.reasoning_level}",
+                 short_path(self.settings.tools.workspace)]
+        try:
+            ratio = self._context_ratio()
+        except Exception:
+            logger.exception("计算上下文占用失败")
+            ratio = None
+        if ratio is not None:
+            parts.append(f"上下文 {ratio:.0%}")
+        if not self.rt.approval.enabled:
+            parts.append("确认已关闭")
+        return " · ".join(parts)
+
     def read_input(self) -> str:
         if self.session is not None:
-            from prompt_toolkit.formatted_text import HTML
+            self._status = self.status_line()
             try:
-                return self.session.prompt(HTML("<ansigreen><b>你 › </b></ansigreen>"))
+                return self.session.prompt(self._prompt_message)
             except (KeyboardInterrupt, EOFError):
                 raise
             except Exception as e:
                 logger.warning("prompt_toolkit 输入失败，改用简单输入：%s", e)
                 self.session = None
-        return self.console.input("[bold green]你 › [/]")
+        self.console.rule(style="grey35")
+        return self.console.input("[bold cyan]› [/]")
 
     # ---------- 主循环 ----------
     def banner(self) -> None:
-        mc = self.rt.model_config
         info = Text.assemble(
-            (f"{self.settings.agent.name}", "bold cyan"), f"  v{__version__}\n",
-            ("模型    ", "dim"), f"{mc.name} ({mc.model})\n",
-            ("推理    ", "dim"), f"{self.rt.reasoning_level}\n",
-            ("工作目录 ", "dim"), f"{self.settings.tools.workspace}\n",
-            ("会话    ", "dim"), f"{self.rt.thread_id}\n",
-            ("输入 /help 查看命令，Esc+Enter 换行，Ctrl+C 中断回答", "dim"),
+            ("✻ ", "bold cyan"), (self.settings.agent.name, "bold"), (f" v{__version__}", "dim"), "\n\n",
+            self.rt.model_config.model, (f" · 推理 {self.rt.reasoning_level}", "dim"), "\n",
+            (short_path(self.settings.tools.workspace), "dim"),
         )
-        self.console.print(Panel(info, border_style="cyan", expand=False))
+        self.console.print(Panel(info, border_style="cyan", expand=False, padding=(0, 2)))
+        if self.session is None:  # 没有状态栏时，把提示放在这里
+            self.console.print(Text("  /help 查看命令 · Ctrl+C 中断回答", style="dim"))
+        self.console.print()
 
     def loop(self) -> None:
         self.banner()
@@ -256,7 +367,7 @@ class AgentCLI:
             message = HumanMessage(user_input)
         payload: Any = {"messages": [message]}
         always_allow: set[str] = set()
-        self.console.print(Text(f"{self.settings.agent.name} ›", style="bold cyan"))
+        self.console.print()
         try:
             while True:
                 self._stream(payload, config)
@@ -368,18 +479,14 @@ class AgentCLI:
                         self.printer.end()
                         if self.settings.cli.show_tool_calls:
                             for tc in m.tool_calls:
-                                self.console.print(Text.assemble(
-                                    ("  ▶ ", "magenta"), (tc["name"], "bold magenta"), " ", (short(tc["args"]), "dim")))
+                                self.console.print(tool_call_text(tc))
                         self.printer.wait("执行工具…")
             elif node == "tools":
                 self.printer.end()
                 if self.settings.cli.show_tool_calls:
                     for m in msgs:
                         if isinstance(m, ToolMessage):
-                            ok = m.status != "error"
-                            self.console.print(Text.assemble(
-                                ("  ✓ " if ok else "  ✗ ", "green" if ok else "red"),
-                                (short(message_text(m) or str(m.content), 200), "dim")))
+                            self.console.print(tool_result_text(m))
                 self.printer.wait()
 
     # ---------- 危险操作确认 ----------
@@ -544,21 +651,19 @@ class AgentCLI:
             self.console.print(f"[dim]……（省略前 {len(msgs) - limit} 条，/history 查看全部）[/]")
             msgs = msgs[-limit:]
         self.console.rule("[dim]会话记录[/]")
-        for m in msgs:
+        for i, m in enumerate(msgs):
             if isinstance(m, HumanMessage):
-                self.console.print(Text.assemble(("你 › ", "bold green"), message_text(m)))
+                if i:
+                    self.console.print()
+                self.console.print(Text.assemble(("› ", "bold cyan"), message_text(m)))
             elif isinstance(m, AIMessage):
                 _, text = extract_chunk(m)
                 if text.strip():
-                    self.console.print(Text(f"{self.settings.agent.name} ›", style="bold cyan"))
-                    self.console.print(Markdown(text.strip()))
+                    self.console.print(bullet(Markdown(text.strip())))
                 for tc in m.tool_calls:
-                    self.console.print(Text.assemble(("  ▶ ", "magenta"), (tc["name"], "magenta"), " ",
-                                                     (short(tc["args"]), "dim")))
+                    self.console.print(tool_call_text(tc))
             elif isinstance(m, ToolMessage):
-                ok = m.status != "error"
-                self.console.print(Text.assemble(("  ✓ " if ok else "  ✗ ", "green" if ok else "red"),
-                                                 (short(message_text(m) or str(m.content), 120), "dim")))
+                self.console.print(tool_result_text(m, 120))
         self.console.rule()
 
     def cmd_model(self, arg: str) -> None:
