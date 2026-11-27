@@ -5,14 +5,12 @@ import argparse
 import json
 import logging
 import sys
-import time
 from datetime import date
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
-from langgraph.types import Command
 from rich.console import Console, Group
 from rich.live import Live
 from rich.segment import Segment
@@ -31,6 +29,8 @@ from .config import REASONING_LEVELS, ConfigError, Settings, SetupRequired, load
 from .onboarding import run_doctor, run_import, run_init
 from .graph import extract_chunk, message_text
 from .usage import Usage, fmt_tokens, format_usage_line
+from . import turn
+from .turn import TurnRunner
 
 logger = logging.getLogger("mimir")
 
@@ -205,6 +205,7 @@ class AgentCLI:
         self.printer = StreamPrinter(console, self.settings.cli.show_reasoning)
         self.listing: list = []  # 最近一次 /sessions 的结果，用于按序号恢复
         self._status = ""  # 输入框下方的状态栏，每次等待输入前刷新
+        self._runner: TurnRunner | None = None  # 正在执行的一轮对话
         self.session = self._make_prompt_session()
 
     # ---------- 输入 ----------
@@ -344,150 +345,76 @@ class AgentCLI:
 
     # ---------- 一轮对话 ----------
     def run_turn(self, user_input: str) -> None:
-        config = self.rt.run_config()
-        started = time.perf_counter()
-        self.rt.begin_turn()
-        try:
-            self.rt.repair_dangling_tool_calls()
-        except Exception:
-            logger.exception("修复中断的工具调用失败")
-
-        # 项目说明（MIMIR.md）在会话中途变化时，把最新内容记在本轮用户消息上，发送时附带提醒
-        from .project_context import PROJECT_UPDATE_KEY
-        update = None
-        try:
-            update = self.rt.check_project_update()
-        except Exception:
-            logger.exception("检查项目说明更新失败")
-        if update:
-            self.console.print(Text(f"  ◇ 检测到 {update['file']} 已{'修改' if update['text'] else '删除'}，"
-                                    "本轮会把最新内容告诉模型", style="cyan"))
-            message = HumanMessage(user_input, additional_kwargs={PROJECT_UPDATE_KEY: update})
-        else:
-            message = HumanMessage(user_input)
-        payload: Any = {"messages": [message]}
-        always_allow: set[str] = set()
+        """执行一轮对话。执行逻辑在 TurnRunner 里，这里只负责显示它发出的事件。"""
         self.console.print()
+        self._runner = TurnRunner(self.rt, self.on_event, self._ask_approval, streaming=self.settings.cli.stream)
         try:
-            while True:
-                self._stream(payload, config)
-                interrupts = self.rt.pending_interrupts()
-                if not interrupts:
-                    break
-                value = interrupts[0].value or {}
-                decision, always = self._ask_approval(value)
-                if always:
-                    always_allow.add(value.get("tool", ""))
-                payload = Command(resume=decision)
-        except KeyboardInterrupt:
+            self._runner.run(user_input)
+        finally:
+            self._runner = None
             self.printer.end()
+        self.console.print()
+
+    def on_event(self, ev: turn.Event) -> None:
+        show_tools = self.settings.cli.show_tool_calls
+        if isinstance(ev, turn.Status):
+            self.printer.wait(ev.text)
+        elif isinstance(ev, turn.ReasoningDelta):
+            self.printer.feed("reasoning", ev.text)
+        elif isinstance(ev, turn.TextDelta):
+            self.printer.feed("text", ev.text)
+        elif isinstance(ev, turn.ToolCall):
+            self.printer.end()
+            if show_tools:
+                self.console.print(tool_call_text(ev.call))
+        elif isinstance(ev, turn.ToolResult):
+            self.printer.end()
+            if show_tools:
+                self.console.print(tool_result_text(ev.message))
+        elif isinstance(ev, turn.Retry):
+            self.printer.discard()  # 清掉半截输出
+            self.console.print(Text.assemble(
+                ("  ⟳ ", "yellow"), (f"连接中断，{ev.delay}s 后重试（{ev.attempt}/{ev.max}）", "yellow"),
+                " ", (short(ev.error, 100), "dim")))
+        elif isinstance(ev, turn.Compact):
+            self._show_compact(ev)
+        elif isinstance(ev, turn.ProjectUpdated):
+            self.console.print(Text(f"  ◇ 检测到 {ev.file} 已{'删除' if ev.deleted else '修改'}，"
+                                    "本轮会把最新内容告诉模型", style="cyan"))
+        elif isinstance(ev, turn.TurnEnd):
+            self._show_turn_end(ev)
+
+    def _show_compact(self, ev: turn.Compact) -> None:
+        """上下文压缩：开始时由随后的 Status 显示等待动画，结束时提示压缩结果。"""
+        if ev.stage == "start":
+            return
+        self.printer.end()
+        if ev.stage == "done":
+            self.console.print(Text.assemble(
+                ("  ◇ ", "cyan"), (f"已将较早的 {ev.messages} 条消息压缩为摘要", "cyan"),
+                (f"（约 {ev.before:,} → {ev.after:,} tokens）", "dim")))
+        else:
+            self.console.print(Text.assemble(
+                ("  ⚠ ", "yellow"), (f"摘要生成失败，已省略较早的 {ev.messages} 条消息", "yellow"),
+                " ", (short(ev.error, 100), "dim")))
+
+    def _show_turn_end(self, ev: turn.TurnEnd) -> None:
+        self.printer.end()
+        e = ev.error
+        if ev.interrupted:
             self.console.print("[yellow]已中断本轮回答[/]")
-        except GraphRecursionError:
-            self.printer.end()
+        elif isinstance(e, GraphRecursionError):
             self.console.print(f"[yellow]已达到单轮最大步数（{self.settings.agent.recursion_limit}），已停止。"
                                "可在 config.yaml 调大 agent.recursion_limit[/]")
-        except Exception as e:
-            self.printer.end()
-            logger.exception("对话出错")
+        elif e is not None:
             self.console.print(f"[red]出错：{type(e).__name__}: {escape(str(e))}[/]")
             from .graph import is_transient_error
             if is_transient_error(e):
                 self.console.print(f"[yellow]连接多次中断（已自动重试 {self.settings.agent.stream_retries} 次），"
                                    "请检查网络或代理后重新发送；可在 config.yaml 调整 agent.stream_retries[/]")
-        finally:
-            self.printer.end()
-            for name in always_allow:  # 一轮结束后再更新策略，避免中断恢复时重放不一致
-                self.rt.approval.allow(name)
-            try:
-                self.rt.record_turn(user_input)
-            except Exception:
-                logger.exception("保存会话信息失败")
-            self.rt.sync_transcript()  # 兜底：中断/出错时也把已产生的消息写入明文记录
-            self._print_turn_usage(time.perf_counter() - started)
-        self.console.print()
-
-    def _print_turn_usage(self, elapsed: float) -> None:
-        try:
-            u = self.rt.finish_turn()
-        except Exception:
-            logger.exception("统计用量失败")
-            return
-        if self.settings.cli.show_usage and u.calls:
-            self.console.print(Text(format_usage_line(u, elapsed), style="dim"))
-
-    def _stream(self, payload: Any, config: dict) -> None:
-        streaming = self.settings.cli.stream
-        modes = ["messages", "updates", "custom"] if streaming else ["updates", "custom"]
-        self.printer.wait()
-        for mode, data in self.rt.graph.stream(payload, config, stream_mode=modes):
-            if mode == "messages":
-                chunk, meta = data
-                if meta.get("langgraph_node") != "agent" or not isinstance(chunk, (AIMessageChunk, AIMessage)):
-                    continue
-                reasoning, text = extract_chunk(chunk)
-                self.printer.feed("reasoning", reasoning)
-                self.printer.feed("text", text)
-            elif mode == "custom" and isinstance(data, dict) and data.get("type") == "retry":
-                self._handle_retry(data)
-            elif mode == "custom" and isinstance(data, dict) and data.get("type") == "compact":
-                self._handle_compact(data)
-            elif mode == "updates" and isinstance(data, dict):
-                self._handle_update(data, streaming)
-                self.rt.sync_transcript()  # 每个节点完成后立即追加，时间戳更准确
-        self.printer.end()
-
-    def _handle_retry(self, data: dict) -> None:
-        """模型请求连接中断：清掉半截输出，提示并等待重试。"""
-        self.printer.discard()
-        attempt, total, delay = data.get("attempt"), data.get("max"), data.get("delay")
-        self.console.print(Text.assemble(
-            ("  ⟳ ", "yellow"), (f"连接中断，{delay}s 后重试（{attempt}/{total}）", "yellow"),
-            " ", (short(str(data.get("error", "")), 100), "dim")))
-        self.printer.wait("重新连接中…")
-
-    def _handle_compact(self, data: dict) -> None:
-        """上下文压缩：开始时显示等待动画，结束时提示压缩结果。"""
-        n = data.get("messages")
-        if data.get("stage") == "start":
-            self.printer.wait(f"上下文接近上限，正在摘要较早的 {n} 条消息…")
-            return
-        self.printer.end()
-        if data.get("stage") == "done":
-            self.console.print(Text.assemble(
-                ("  ◇ ", "cyan"), (f"已将较早的 {n} 条消息压缩为摘要", "cyan"),
-                (f"（约 {data.get('before', 0):,} → {data.get('after', 0):,} tokens）", "dim")))
-        else:
-            self.console.print(Text.assemble(
-                ("  ⚠ ", "yellow"), (f"摘要生成失败，已省略较早的 {n} 条消息", "yellow"),
-                " ", (short(str(data.get("error", "")), 100), "dim")))
-        self.printer.wait()
-
-    def _handle_update(self, data: dict, streaming: bool) -> None:
-        for node, value in data.items():
-            if not isinstance(value, dict):
-                continue
-            msgs = value.get("messages") or []
-            if node == "agent":
-                for m in msgs:
-                    if not isinstance(m, AIMessage):
-                        continue
-                    if not streaming:
-                        reasoning, text = extract_chunk(m)
-                        self.printer.feed("reasoning", reasoning)
-                        self.printer.feed("text", text)
-                    if m.tool_calls:
-                        self.printer.end()
-                        if self.settings.cli.show_tool_calls:
-                            for tc in m.tool_calls:
-                                self.console.print(tool_call_text(tc))
-                        self.printer.wait("执行工具…")
-            elif node == "tools":
-                self.printer.end()
-                if self.settings.cli.show_tool_calls:
-                    for m in msgs:
-                        if isinstance(m, ToolMessage):
-                            self.console.print(tool_result_text(m))
-                self.printer.wait()
+        u = ev.usage
+        if u is not None and self.settings.cli.show_usage and u.calls:
+            self.console.print(Text(format_usage_line(u, ev.elapsed), style="dim"))
 
     # ---------- 危险操作确认 ----------
     def _format_args(self, tool: str, args: dict):
