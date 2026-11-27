@@ -38,14 +38,13 @@ from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.styles import Style
-from prompt_toolkit.utils import get_cwidth
 from rich.console import Console, ConsoleDimensions
 from rich.padding import Padding
 from rich.text import Text
 
 from .cli import EXIT_WORDS, AgentCLI, stream_renderable
 from .turn import THINKING
-from .usage import fmt_tokens
+from .usage import Usage, fmt_tokens
 
 logger = logging.getLogger("mimir")
 
@@ -66,6 +65,7 @@ STYLE = Style.from_dict({
     "ctx-mid": "ansiyellow",
     "ctx-high": "ansired",
     "ctx-empty": "#444444",
+    "cache": "#5fafaf",
 })
 
 
@@ -86,6 +86,18 @@ def context_bar(usage: tuple[int, int] | None, width: int = 20) -> StyleAndTextT
         ("class:ctx-empty", "░" * (width - filled)),
         ("class:dim", f" {ratio:.0%} · {fmt_tokens(used)}/{fmt_tokens(window)}"),
     ]
+
+
+def cache_text(last: Usage | None) -> StyleAndTextTuples:
+    """最近一次模型调用的缓存命中：缓存 75% · 1.2k。还没调用过时为“缓存 —”。"""
+    if last is None or last.input <= 0:
+        return [("class:dim", "缓存 —")]
+    return [("class:dim", "缓存 "), ("class:cache", f"{last.cache_rate:.0%}"),
+            ("class:dim", f" · {fmt_tokens(last.cache_read)}")]
+
+
+# 底部状态栏的数据：(审批是否开启, (上下文已用, 窗口), 最近一次调用的用量)
+FooterState = tuple[bool, "tuple[int, int] | None", "Usage | None"]
 
 
 class _Segment:
@@ -419,14 +431,15 @@ class FixedInputUI:
         return out
 
     def _footer_fragments(self) -> StyleAndTextTuples:
-        enabled, usage = self.footer_state
-        left: StyleAndTextTuples = [("class:approval", "  审批：开启")] if enabled \
+        """底部一行，从左到右：审批状态 │ 上下文进度条 │ 缓存命中（│ 临时提示）。"""
+        enabled, usage, last = self.footer_state
+        sep = ("class:rule", "  │  ")
+        out: StyleAndTextTuples = [("class:approval", "  审批：开启")] if enabled \
             else [("class:approval-off", "  审批：关闭")]
+        out += [sep, *context_bar(usage), sep, *cache_text(last)]
         if self.hint:
-            left.append(("class:dim", f" · {self.hint}"))
-        right = context_bar(usage) + [("", " ")]
-        used = sum(get_cwidth(t) for _, t, *_ in left + right)
-        return left + [("", " " * max(1, self.term_size()[0] - used - 1))] + right
+            out += [sep, ("class:ctx-mid", self.hint)]
+        return out
 
     # ====================== 按键 ======================
     def _key_bindings(self) -> KeyBindings:
@@ -551,7 +564,7 @@ class FixedInputUI:
         if not item.startswith("/"):
             self.running, self.turn_started, self.status = True, time.monotonic(), THINKING
 
-    def _end(self, state: tuple[bool, tuple[int, int] | None]) -> None:
+    def _end(self, state: FooterState) -> None:
         self.running = False
         self.footer_state = state
 
@@ -563,10 +576,12 @@ class FixedInputUI:
             body.append("\n  " + line)
         self.cli.console.print(Padding(body, (0, 1), style="on #303030", expand=True))
 
-    def _footer_state(self) -> tuple[bool, tuple[int, int] | None]:
+    def _footer_state(self) -> FooterState:
+        """（后台线程）底部状态栏要显示的数据：读会话状态比较慢，只在每次处理完输入后算一次。"""
         try:
-            usage = self.cli.context_usage()
+            last = self.cli.last_call_usage()
+            usage = self.cli.context_usage(last)
         except Exception:
             logger.exception("计算上下文占用失败")
-            usage = None
-        return self.cli.rt.approval.enabled, usage
+            last = usage = None
+        return self.cli.rt.approval.enabled, usage, last

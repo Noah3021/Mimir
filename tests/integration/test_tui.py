@@ -14,7 +14,8 @@ from rich.console import Console
 from mimir.agent import AgentRuntime
 from mimir.cli import AgentCLI, banner_renderable
 from mimir.config import load_settings
-from mimir.tui import FixedInputUI, context_bar
+from mimir.tui import FixedInputUI, cache_text, context_bar
+from mimir.usage import Usage
 from tests.fakes import ScriptedChatModel, tool_call
 
 CONFIG = """
@@ -120,6 +121,30 @@ def test_context_bar_levels():
     assert context_bar((60_000, 100_000))[1][0] == "class:ctx-mid"
     assert context_bar((95_000, 100_000))[1][0] == "class:ctx-high"
     assert plain(context_bar((200_000, 100_000), width=4)).startswith("上下文 ████ 200%")
+
+
+
+def plain(frags) -> str:
+    return "".join(t for _, t, *_ in frags)
+
+
+def test_cache_text():
+    assert plain(cache_text(None)) == "缓存 —"
+    assert plain(cache_text(Usage(input=0))) == "缓存 —"
+    assert plain(cache_text(Usage(input=4000, cache_read=3000))) == "缓存 75% · 3.0k"
+    assert plain(cache_text(Usage(input=1600))) == "缓存 0% · 0"
+
+
+def test_footer_order(cli):
+    """底部一行从左到右：审批 │ 上下文 │ 缓存，紧挨着排，不再把进度条推到最右边。"""
+    ui = FixedInputUI(cli, output=RecordingOutput())
+    ui.footer_state = (True, (16_000, 128_000), Usage(input=16_000, cache_read=12_000))
+    text = plain(ui._footer_fragments())
+    assert text.startswith("  审批：开启  │  上下文 ")
+    assert text.index("上下文") < text.index("缓存 75% · 12.0k")
+    assert "   " not in text.split("│")[-1].strip()  # 末尾没有填充空格
+    ui.footer_state = (False, None, None)
+    assert plain(ui._footer_fragments()) == "  审批：关闭  │  上下文 —  │  缓存 —"
 
 
 def render(renderable, width):

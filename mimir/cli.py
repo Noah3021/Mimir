@@ -29,7 +29,7 @@ from .agent import AgentRuntime
 from .config import REASONING_LEVELS, ConfigError, Settings, SetupRequired, load_settings
 from .onboarding import run_doctor, run_import, run_init
 from .graph import extract_chunk, message_text
-from .usage import Usage, fmt_tokens, format_usage_line
+from .usage import Usage, fmt_tokens, format_usage_line, usage_of
 from . import turn
 from .turn import TurnRunner
 
@@ -157,6 +157,7 @@ LOGO = (
 )
 LOGO_COLORS = ("#00d7ff", "#00c3ff", "#00afff", "#009bff", "#0087ff", "#0073ff")
 LOGO_GAP = 3
+INFO_MUTED = "#5f87af"  # 启动画面右侧的次要信息（版本号、推理强度）
 
 
 def banner_renderable(name: str, version: str, model: str, reasoning: str, workspace: str,
@@ -165,9 +166,11 @@ def banner_renderable(name: str, version: str, model: str, reasoning: str, works
 
     终端太窄或者编码不是 UTF-8 时只显示右边的三行。
     """
-    info = Text.assemble((name, "bold"), (f" v{version}", "dim"), "\n",
-                         model, (f" · 推理 {reasoning}", "dim"), "\n",
-                         (workspace, "dim"))
+    # 三行垂直居中，正好对着 logo 的第 2~4 行，各取那一行的颜色；次要信息用偏灰的蓝
+    c1, c2, c3 = LOGO_COLORS[1:4]
+    info = Text.assemble((name, f"bold {c1}"), (f" v{version}", INFO_MUTED), "\n",
+                         (model, c2), (f" · 推理 {reasoning}", INFO_MUTED), "\n",
+                         (workspace, c3))
     info_width = max(cell_len(line) for line in info.plain.split("\n"))
     logo_width = max(cell_len(line) for line in LOGO)
     if not unicode or width < logo_width + LOGO_GAP + info_width:
@@ -321,15 +324,21 @@ class AgentCLI:
             ("class:hint", "  /help 查看命令 · Esc+Enter 换行 · Ctrl+C 中断回答"),
         ]
 
-    def context_usage(self) -> tuple[int, int] | None:
+    def last_call_usage(self) -> Usage | None:
+        """当前会话最近一次模型调用的用量（含缓存命中），还没调用过时为 None。"""
+        for m in reversed(self.rt.messages()):
+            u = usage_of(m)
+            if u is not None:
+                return u
+        return None
+
+    def context_usage(self, last: Usage | None = None) -> tuple[int, int] | None:
         """(最近一次模型调用的 输入 + 输出 token, 上下文窗口)，还没调用过时为 None。"""
         window = self.rt.model_config.context_window or self.settings.agent.context.window
-        for m in reversed(self.rt.messages()):
-            um = getattr(m, "usage_metadata", None) if isinstance(m, AIMessage) else None
-            if um:
-                used = int(um.get("input_tokens") or 0) + int(um.get("output_tokens") or 0)
-                return (used, window) if window else None
-        return None
+        last = last if last is not None else self.last_call_usage()
+        if last is None or not window:
+            return None
+        return last.input + last.output, window
 
     def _context_ratio(self) -> float | None:
         """最近一次模型调用的 输入 + 输出 token 占上下文窗口的比例，还没调用过时为 None。"""
