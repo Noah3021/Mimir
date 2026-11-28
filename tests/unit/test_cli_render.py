@@ -7,7 +7,22 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
-from mimir.cli import StreamPrinter, _Tail, clip_lines, parse_args, short
+from pathlib import Path
+
+from langchain_core.messages import ToolMessage
+from rich.markdown import Markdown
+
+from mimir.cli import (
+    StreamPrinter,
+    _Tail,
+    bullet,
+    clip_lines,
+    parse_args,
+    short,
+    short_path,
+    tool_call_text,
+    tool_result_text,
+)
 
 
 def make_console(**kw) -> Console:
@@ -40,6 +55,48 @@ def test_clip_lines_truncates():
     out = clip_lines("\n".join(str(i) for i in range(100)), 3)
     assert out.splitlines()[:3] == ["0", "1", "2"]
     assert "共 100 行，仅显示前 3 行" in out
+
+
+# ---------------- short_path ----------------
+def test_short_path_under_home():
+    assert short_path(Path.home() / "Desktop" / "test") == str(Path("~") / "Desktop" / "test")
+    assert short_path(Path.home()) == "~"
+
+
+def test_short_path_outside_home_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    assert short_path(tmp_path / "other") == str(tmp_path / "other")
+
+
+# ---------------- 工具调用展示 ----------------
+def test_tool_call_text_shows_key_argument_only():
+    t = tool_call_text({"name": "run_shell", "args": {"command": "git status", "timeout": 30}})
+    assert t.plain == "● run_shell(git status)"
+    assert tool_call_text({"name": "read_file", "args": {"path": "a.txt", "start": 1}}).plain == "● read_file(a.txt)"
+
+
+def test_tool_call_text_falls_back_to_all_args():
+    assert tool_call_text({"name": "calc", "args": {"a": 1}}).plain == '● calc({"a": 1})'
+    assert tool_call_text({"name": "get_current_time", "args": {}}).plain == "● get_current_time()"
+
+
+def test_tool_result_text_marks_errors():
+    ok = tool_result_text(ToolMessage("第一行\n第二行", tool_call_id="1"))
+    assert ok.plain == "  └ 第一行 第二行"
+    err = tool_result_text(ToolMessage("找不到文件", tool_call_id="2", status="error"))
+    assert err.plain == "  └ 找不到文件"
+    assert "red" in str(err.spans[-1].style)
+
+
+# ---------------- bullet ----------------
+def test_bullet_prefixes_first_line_and_indents_rest():
+    console = make_console(width=30)
+    console.print(bullet(Markdown("第一段\n\n- " + "很长" * 20)))
+    lines = output(console).rstrip("\n").splitlines()
+    assert lines[0].startswith("● 第一段")
+    assert all(line.startswith("  ") for line in lines[1:])
+    assert "…" not in output(console)  # 列表项换行显示，不截断
+    assert output(console).count("很长") == 20
 
 
 # ---------------- _Tail ----------------

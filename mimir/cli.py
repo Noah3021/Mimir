@@ -5,19 +5,20 @@ import argparse
 import json
 import logging
 import sys
-import time
+from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
-from langgraph.types import Command
 from rich.console import Console, Group
 from rich.live import Live
 from rich.segment import Segment
 from rich.markdown import Markdown
+from rich.cells import cell_len
 from rich.markup import escape
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.syntax import Syntax
@@ -29,7 +30,9 @@ from .agent import AgentRuntime
 from .config import REASONING_LEVELS, ConfigError, Settings, SetupRequired, load_settings
 from .onboarding import run_doctor, run_import, run_init
 from .graph import extract_chunk, message_text
-from .usage import Usage, fmt_tokens, format_usage_line
+from .usage import Usage, fmt_tokens, format_usage_line, usage_of
+from . import turn
+from .turn import TurnRunner
 
 logger = logging.getLogger("mimir")
 
@@ -66,6 +69,56 @@ def clip_lines(text: str, max_lines: int = 40) -> str:
     return "\n".join(lines[:max_lines]) + f"\n…（共 {len(lines)} 行，仅显示前 {max_lines} 行）"
 
 
+def short_path(p: Any) -> str:
+    """用户目录下的路径缩写成 ~ 开头，例如 ~\\Desktop\\test。"""
+    p = Path(p)
+    try:
+        rel = p.resolve().relative_to(Path.home().resolve())
+    except (ValueError, OSError):
+        return str(p)
+    return "~" if rel == Path(".") else str(Path("~") / rel)
+
+
+class bullet:  # noqa: N801 —— 用起来像函数：bullet(Markdown(...))
+    """在内容左侧加一个标记，后续行缩进 2 列对齐。
+
+    不用 Table.grid：表格单元格里的 Markdown 列表项会被截断成“…”，不会换行。
+    """
+
+    def __init__(self, renderable: Any, mark: str = "●", style: str = "cyan"):
+        self.renderable, self.mark, self.style = renderable, mark, style
+
+    def __rich_console__(self, console: Console, options):
+        inner = options.update_width(max(options.max_width - 2, 10))
+        lines = console.render_lines(self.renderable, inner, pad=False)
+        while lines and not "".join(s.text for s in lines[-1]).strip():
+            lines.pop()  # 去掉 Markdown 末尾的空行
+        for i, line in enumerate(lines):
+            yield Segment(self.mark + " ", console.get_style(self.style)) if i == 0 else Segment("  ")
+            yield from line
+            yield Segment.line()
+
+
+# 工具调用只显示最能说明意图的那个参数，完整参数在确认框和 /history 里看
+_BRIEF_KEYS = ("command", "path", "pattern", "query", "url", "expression")
+
+
+def tool_call_text(tc: dict) -> Text:
+    """一次工具调用：● run_shell(git status)"""
+    args = tc.get("args") or {}
+    brief = None
+    if isinstance(args, dict):
+        brief = next((str(args[k]) for k in _BRIEF_KEYS if args.get(k) not in (None, "")), None)
+    brief = short(brief if brief is not None else (args or ""))
+    return Text.assemble(("● ", "magenta"), (tc.get("name", "?"), "bold"), ("(", "dim"), brief, (")", "dim"))
+
+
+def tool_result_text(m: ToolMessage, limit: int = 200) -> Text:
+    """工具结果，接在调用下面：  └ 结果摘要（出错时为红色）"""
+    ok = m.status != "error"
+    return Text.assemble(("  └ ", "dim"), (short(message_text(m) or str(m.content), limit), "dim" if ok else "red"))
+
+
 class _Tail:
     """只渲染内容的最后若干行，保证 Live 区域始终不超过终端高度。
 
@@ -84,6 +137,53 @@ class _Tail:
         for line in lines:
             yield from line
             yield Segment.line()
+
+
+def stream_renderable(mode: str, buf: str) -> Any:
+    """一段流式内容的显示：思考过程（标题 + 缩进的灰色斜体）或正文（● + Markdown）。"""
+    if mode == "reasoning":
+        return Group(Text("✻ 思考过程", style="dim bold"),
+                     Padding(Text(buf.strip(), style="dim italic"), (0, 0, 0, 2)))
+    return bullet(Markdown(buf.strip()))
+
+
+# 启动画面左侧的大号字母（ANSI Shadow 字体），从上到下 cyan → blue 渐变
+LOGO = (
+    "███╗   ███╗██╗███╗   ███╗██╗██████╗ ",
+    "████╗ ████║██║████╗ ████║██║██╔══██╗",
+    "██╔████╔██║██║██╔████╔██║██║██████╔╝",
+    "██║╚██╔╝██║██║██║╚██╔╝██║██║██╔══██╗",
+    "██║ ╚═╝ ██║██║██║ ╚═╝ ██║██║██║  ██║",
+    "╚═╝     ╚═╝╚═╝╚═╝     ╚═╝╚═╝╚═╝  ╚═╝",
+)
+LOGO_COLORS = ("#00d7ff", "#00c3ff", "#00afff", "#009bff", "#0087ff", "#0073ff")
+LOGO_GAP = 3
+INFO_MUTED = "#5f87af"  # 启动画面右侧的次要信息（版本号、推理强度）
+
+
+def banner_renderable(name: str, version: str, model: str, reasoning: str, workspace: str,
+                      *, width: int, unicode: bool = True) -> Any:
+    """启动画面：左边大号字母，右边三行（名字和版本、模型和推理强度、工作目录）。
+
+    终端太窄或者编码不是 UTF-8 时只显示右边的三行。
+    """
+    # 三行垂直居中，正好对着 logo 的第 2~4 行，各取那一行的颜色；次要信息用偏灰的蓝
+    c1, c2, c3 = LOGO_COLORS[1:4]
+    info = Text.assemble((name, f"bold {c1}"), (f" v{version}", INFO_MUTED), "\n",
+                         (model, c2), (f" · 推理 {reasoning}", INFO_MUTED), "\n",
+                         (workspace, c3))
+    info_width = max(cell_len(line) for line in info.plain.split("\n"))
+    logo_width = max(cell_len(line) for line in LOGO)
+    if not unicode or width < logo_width + LOGO_GAP + info_width:
+        return info
+    logo = Text()
+    for i, (line, color) in enumerate(zip(LOGO, LOGO_COLORS, strict=True)):
+        logo.append(("\n" if i else "") + line, style=f"bold {color}")
+    grid = Table.grid(padding=(0, LOGO_GAP))
+    grid.add_column(no_wrap=True)
+    grid.add_column(vertical="middle", no_wrap=True)
+    grid.add_row(logo, info)
+    return grid
 
 
 class StreamPrinter:
@@ -120,9 +220,8 @@ class StreamPrinter:
         self.live.update(_Tail(self._render()))
 
     def _render(self):
-        if self.mode == "reasoning":  # 标题放在 Live 内，重试丢弃时一并清除
-            return Group(Text("思考过程", style="dim bold"), Text(self.buf.strip(), style="dim italic"))
-        return Markdown(self.buf.strip())
+        # 思考过程的标题也放在 Live 内，重试丢弃时一并清除
+        return stream_renderable(self.mode or "text", self.buf)
 
     def discard(self) -> None:
         """丢弃当前流式区域的内容（不打印），用于请求中断后重试。"""
@@ -152,19 +251,23 @@ class AgentCLI:
         self.settings: Settings = runtime.settings
         self.printer = StreamPrinter(console, self.settings.cli.show_reasoning)
         self.listing: list = []  # 最近一次 /sessions 的结果，用于按序号恢复
+        self._status = ""  # 输入框下方的状态栏，每次等待输入前刷新
+        self._runner: TurnRunner | None = None  # 正在执行的一轮对话
+        self.approver = self._ask_approval  # 危险操作确认；新界面运行时换成底部的选择框
         self.session = self._make_prompt_session()
 
     # ---------- 输入 ----------
     def _make_prompt_session(self):
         try:
             from prompt_toolkit import PromptSession
+            from prompt_toolkit.application import get_app
             from prompt_toolkit.completion import WordCompleter
+            from prompt_toolkit.filters import Condition
             from prompt_toolkit.history import FileHistory
             from prompt_toolkit.key_binding import KeyBindings
+            from prompt_toolkit.styles import Style
 
-            words = [c.split()[0] for c, _ in COMMANDS] + ["/quit", "/approve on", "/approve off"]
-            words += [f"/model {n}" for n in self.settings.models]
-            words += [f"/think {lv}" for lv in REASONING_LEVELS]
+            words = self.completion_words()
             kb = KeyBindings()
 
             @kb.add("escape", "enter")  # Esc+Enter（或 Alt+Enter）换行
@@ -176,42 +279,131 @@ class AgentCLI:
             if hist:
                 hist.parent.mkdir(parents=True, exist_ok=True)
                 history = FileHistory(str(hist))
+            # 只在输入斜杠命令时边输边补全。补全开启时 prompt_toolkit 会在输入行下方预留菜单的空间，
+            # 一直开着的话，输入行和状态栏之间总隔着几行空白
+            slash = Condition(lambda: get_app().current_buffer.text.startswith("/"))
             return PromptSession(
                 history=history,
                 completer=WordCompleter(words, ignore_case=True, sentence=True),
                 key_bindings=kb,
-                complete_while_typing=True,
+                complete_while_typing=slash,
+                bottom_toolbar=self._toolbar,
+                style=Style.from_dict({
+                    "bottom-toolbar": "noreverse",  # 默认是反色的整条色块
+                    "rule": "#5f5f5f",
+                    "prompt": "bold ansicyan",
+                    "status": "#8a8a8a",
+                    "hint": "#5f5f5f",
+                }),
             )
         except Exception as e:  # 例如 Git Bash(mintty) 中没有 Windows 控制台
             logger.warning("prompt_toolkit 不可用，改用简单输入：%s", e)
             return None
 
+    def completion_words(self) -> list[str]:
+        words = [c.split()[0] for c, _ in COMMANDS] + ["/quit", "/approve on", "/approve off"]
+        words += [f"/model {n}" for n in self.settings.models]
+        words += [f"/think {lv}" for lv in REASONING_LEVELS]
+        return words
+
+    @staticmethod
+    def _pt_width() -> int:
+        from prompt_toolkit.application import get_app
+        try:
+            return max(get_app().output.get_size().columns, 20)
+        except Exception:
+            return 80
+
+    def _prompt_message(self):
+        """输入行上方一条横线，留在滚动区里正好把每轮对话隔开。"""
+        return [("class:rule", "─" * self._pt_width() + "\n"), ("class:prompt", "› ")]
+
+    def _toolbar(self):
+        """输入行下方：横线 + 状态栏 + 快捷键提示。按回车后自动消失，不留在滚动区。"""
+        return [
+            ("class:rule", "─" * self._pt_width() + "\n"),
+            ("class:status", f"  {self._status}\n"),
+            ("class:hint", "  /help 查看命令 · Esc+Enter 换行 · Ctrl+C 中断回答"),
+        ]
+
+    def last_call_usage(self, messages: Sequence[BaseMessage] | None = None) -> Usage | None:
+        """当前会话最近一次模型调用的用量（含缓存命中），还没调用过时为 None。传入 messages 可免去重复读状态。"""
+        for m in reversed(self.rt.messages() if messages is None else messages):
+            u = usage_of(m)
+            if u is not None:
+                return u
+        return None
+
+    def context_usage(self, last: Usage | None = None) -> tuple[int, int] | None:
+        """(最近一次模型调用的 输入 + 输出 token, 上下文窗口)，还没调用过时为 None。"""
+        window = self.rt.model_config.context_window or self.settings.agent.context.window
+        last = last if last is not None else self.last_call_usage()
+        if last is None or not window:
+            return None
+        return last.input + last.output, window
+
+    def _context_ratio(self) -> float | None:
+        """最近一次模型调用的 输入 + 输出 token 占上下文窗口的比例，还没调用过时为 None。"""
+        usage = self.context_usage()
+        return usage[0] / usage[1] if usage else None
+
+    def status_line(self) -> str:
+        parts = [self.rt.model_config.model, f"推理 {self.rt.reasoning_level}",
+                 short_path(self.settings.tools.workspace)]
+        try:
+            ratio = self._context_ratio()
+        except Exception:
+            logger.exception("计算上下文占用失败")
+            ratio = None
+        if ratio is not None:
+            parts.append(f"上下文 {ratio:.0%}")
+        if not self.rt.approval.enabled:
+            parts.append("确认已关闭")
+        return " · ".join(parts)
+
     def read_input(self) -> str:
         if self.session is not None:
-            from prompt_toolkit.formatted_text import HTML
+            self._status = self.status_line()
             try:
-                return self.session.prompt(HTML("<ansigreen><b>你 › </b></ansigreen>"))
+                return self.session.prompt(self._prompt_message)
             except (KeyboardInterrupt, EOFError):
                 raise
             except Exception as e:
                 logger.warning("prompt_toolkit 输入失败，改用简单输入：%s", e)
                 self.session = None
-        return self.console.input("[bold green]你 › [/]")
+        self.console.rule(style="grey35")
+        return self.console.input("[bold cyan]› [/]")
 
     # ---------- 主循环 ----------
-    def banner(self) -> None:
-        mc = self.rt.model_config
-        info = Text.assemble(
-            (f"{self.settings.agent.name}", "bold cyan"), f"  v{__version__}\n",
-            ("模型    ", "dim"), f"{mc.name} ({mc.model})\n",
-            ("推理    ", "dim"), f"{self.rt.reasoning_level}\n",
-            ("工作目录 ", "dim"), f"{self.settings.tools.workspace}\n",
-            ("会话    ", "dim"), f"{self.rt.thread_id}\n",
-            ("输入 /help 查看命令，Esc+Enter 换行，Ctrl+C 中断回答", "dim"),
-        )
-        self.console.print(Panel(info, border_style="cyan", expand=False))
+    def banner(self, hint: str | None = None) -> None:
+        c = self.console
+        c.print()
+        c.print(banner_renderable(
+            self.settings.agent.name, __version__, self.rt.model_config.model, self.rt.reasoning_level,
+            short_path(self.settings.tools.workspace),
+            width=c.width, unicode=(c.encoding or "").lower().replace("-", "").startswith("utf"),
+        ))
+        if hint is None and self.session is None:  # 没有状态栏时，把提示放在这里
+            hint = "/help 查看命令 · Ctrl+C 中断回答"
+        if hint:
+            c.print()
+            c.print(Text(hint, style="dim"))
+        c.print()
 
     def loop(self) -> None:
+        if self.session is not None:  # 能用 prompt_toolkit 时，用输入框固定在底部的界面
+            try:
+                from .tui import FixedInputUI
+                ui = FixedInputUI(self)
+            except Exception as e:
+                logger.warning("无法启动新界面，改用逐行输入：%s", e)
+            else:
+                ui.run()
+                return
+        self.classic_loop()
+
+    def classic_loop(self) -> None:
+        """逐行输入：等待输入时才显示输入框，回答期间输出直接追加到终端。"""
         self.banner()
         while True:
             try:
@@ -233,154 +425,76 @@ class AgentCLI:
 
     # ---------- 一轮对话 ----------
     def run_turn(self, user_input: str) -> None:
-        config = self.rt.run_config()
-        started = time.perf_counter()
-        self.rt.begin_turn()
+        """执行一轮对话。执行逻辑在 TurnRunner 里，这里只负责显示它发出的事件。"""
+        self.console.print()
+        self._runner = TurnRunner(self.rt, self.on_event, self.approver, streaming=self.settings.cli.stream)
         try:
-            self.rt.repair_dangling_tool_calls()
-        except Exception:
-            logger.exception("修复中断的工具调用失败")
+            self._runner.run(user_input)
+        finally:
+            self._runner = None
+            self.printer.end()
+        self.console.print()
 
-        # 项目说明（MIMIR.md）在会话中途变化时，把最新内容记在本轮用户消息上，发送时附带提醒
-        from .project_context import PROJECT_UPDATE_KEY
-        update = None
-        try:
-            update = self.rt.check_project_update()
-        except Exception:
-            logger.exception("检查项目说明更新失败")
-        if update:
-            self.console.print(Text(f"  ◇ 检测到 {update['file']} 已{'修改' if update['text'] else '删除'}，"
+    def on_event(self, ev: turn.Event) -> None:
+        show_tools = self.settings.cli.show_tool_calls
+        if isinstance(ev, turn.Status):
+            self.printer.wait(ev.text)
+        elif isinstance(ev, turn.ReasoningDelta):
+            self.printer.feed("reasoning", ev.text)
+        elif isinstance(ev, turn.TextDelta):
+            self.printer.feed("text", ev.text)
+        elif isinstance(ev, turn.ToolCall):
+            self.printer.end()
+            if show_tools:
+                self.console.print(tool_call_text(ev.call))
+        elif isinstance(ev, turn.ToolResult):
+            self.printer.end()
+            if show_tools:
+                self.console.print(tool_result_text(ev.message))
+        elif isinstance(ev, turn.Retry):
+            self.printer.discard()  # 清掉半截输出
+            self.console.print(Text.assemble(
+                ("  ⟳ ", "yellow"), (f"连接中断，{ev.delay}s 后重试（{ev.attempt}/{ev.max}）", "yellow"),
+                " ", (short(ev.error, 100), "dim")))
+        elif isinstance(ev, turn.Compact):
+            self._show_compact(ev)
+        elif isinstance(ev, turn.ProjectUpdated):
+            self.console.print(Text(f"  ◇ 检测到 {ev.file} 已{'删除' if ev.deleted else '修改'}，"
                                     "本轮会把最新内容告诉模型", style="cyan"))
-            message = HumanMessage(user_input, additional_kwargs={PROJECT_UPDATE_KEY: update})
+        elif isinstance(ev, turn.TurnEnd):
+            self._show_turn_end(ev)
+
+    def _show_compact(self, ev: turn.Compact) -> None:
+        """上下文压缩：开始时由随后的 Status 显示等待动画，结束时提示压缩结果。"""
+        if ev.stage == "start":
+            return
+        self.printer.end()
+        if ev.stage == "done":
+            self.console.print(Text.assemble(
+                ("  ◇ ", "cyan"), (f"已将较早的 {ev.messages} 条消息压缩为摘要", "cyan"),
+                (f"（约 {ev.before:,} → {ev.after:,} tokens）", "dim")))
         else:
-            message = HumanMessage(user_input)
-        payload: Any = {"messages": [message]}
-        always_allow: set[str] = set()
-        self.console.print(Text(f"{self.settings.agent.name} ›", style="bold cyan"))
-        try:
-            while True:
-                self._stream(payload, config)
-                interrupts = self.rt.pending_interrupts()
-                if not interrupts:
-                    break
-                value = interrupts[0].value or {}
-                decision, always = self._ask_approval(value)
-                if always:
-                    always_allow.add(value.get("tool", ""))
-                payload = Command(resume=decision)
-        except KeyboardInterrupt:
-            self.printer.end()
+            self.console.print(Text.assemble(
+                ("  ⚠ ", "yellow"), (f"摘要生成失败，已省略较早的 {ev.messages} 条消息", "yellow"),
+                " ", (short(ev.error, 100), "dim")))
+
+    def _show_turn_end(self, ev: turn.TurnEnd) -> None:
+        self.printer.end()
+        e = ev.error
+        if ev.interrupted:
             self.console.print("[yellow]已中断本轮回答[/]")
-        except GraphRecursionError:
-            self.printer.end()
+        elif isinstance(e, GraphRecursionError):
             self.console.print(f"[yellow]已达到单轮最大步数（{self.settings.agent.recursion_limit}），已停止。"
                                "可在 config.yaml 调大 agent.recursion_limit[/]")
-        except Exception as e:
-            self.printer.end()
-            logger.exception("对话出错")
+        elif e is not None:
             self.console.print(f"[red]出错：{type(e).__name__}: {escape(str(e))}[/]")
             from .graph import is_transient_error
             if is_transient_error(e):
                 self.console.print(f"[yellow]连接多次中断（已自动重试 {self.settings.agent.stream_retries} 次），"
                                    "请检查网络或代理后重新发送；可在 config.yaml 调整 agent.stream_retries[/]")
-        finally:
-            self.printer.end()
-            for name in always_allow:  # 一轮结束后再更新策略，避免中断恢复时重放不一致
-                self.rt.approval.allow(name)
-            try:
-                self.rt.record_turn(user_input)
-            except Exception:
-                logger.exception("保存会话信息失败")
-            self.rt.sync_transcript()  # 兜底：中断/出错时也把已产生的消息写入明文记录
-            self._print_turn_usage(time.perf_counter() - started)
-        self.console.print()
-
-    def _print_turn_usage(self, elapsed: float) -> None:
-        try:
-            u = self.rt.finish_turn()
-        except Exception:
-            logger.exception("统计用量失败")
-            return
-        if self.settings.cli.show_usage and u.calls:
-            self.console.print(Text(format_usage_line(u, elapsed), style="dim"))
-
-    def _stream(self, payload: Any, config: dict) -> None:
-        streaming = self.settings.cli.stream
-        modes = ["messages", "updates", "custom"] if streaming else ["updates", "custom"]
-        self.printer.wait()
-        for mode, data in self.rt.graph.stream(payload, config, stream_mode=modes):
-            if mode == "messages":
-                chunk, meta = data
-                if meta.get("langgraph_node") != "agent" or not isinstance(chunk, (AIMessageChunk, AIMessage)):
-                    continue
-                reasoning, text = extract_chunk(chunk)
-                self.printer.feed("reasoning", reasoning)
-                self.printer.feed("text", text)
-            elif mode == "custom" and isinstance(data, dict) and data.get("type") == "retry":
-                self._handle_retry(data)
-            elif mode == "custom" and isinstance(data, dict) and data.get("type") == "compact":
-                self._handle_compact(data)
-            elif mode == "updates" and isinstance(data, dict):
-                self._handle_update(data, streaming)
-                self.rt.sync_transcript()  # 每个节点完成后立即追加，时间戳更准确
-        self.printer.end()
-
-    def _handle_retry(self, data: dict) -> None:
-        """模型请求连接中断：清掉半截输出，提示并等待重试。"""
-        self.printer.discard()
-        attempt, total, delay = data.get("attempt"), data.get("max"), data.get("delay")
-        self.console.print(Text.assemble(
-            ("  ⟳ ", "yellow"), (f"连接中断，{delay}s 后重试（{attempt}/{total}）", "yellow"),
-            " ", (short(str(data.get("error", "")), 100), "dim")))
-        self.printer.wait("重新连接中…")
-
-    def _handle_compact(self, data: dict) -> None:
-        """上下文压缩：开始时显示等待动画，结束时提示压缩结果。"""
-        n = data.get("messages")
-        if data.get("stage") == "start":
-            self.printer.wait(f"上下文接近上限，正在摘要较早的 {n} 条消息…")
-            return
-        self.printer.end()
-        if data.get("stage") == "done":
-            self.console.print(Text.assemble(
-                ("  ◇ ", "cyan"), (f"已将较早的 {n} 条消息压缩为摘要", "cyan"),
-                (f"（约 {data.get('before', 0):,} → {data.get('after', 0):,} tokens）", "dim")))
-        else:
-            self.console.print(Text.assemble(
-                ("  ⚠ ", "yellow"), (f"摘要生成失败，已省略较早的 {n} 条消息", "yellow"),
-                " ", (short(str(data.get("error", "")), 100), "dim")))
-        self.printer.wait()
-
-    def _handle_update(self, data: dict, streaming: bool) -> None:
-        for node, value in data.items():
-            if not isinstance(value, dict):
-                continue
-            msgs = value.get("messages") or []
-            if node == "agent":
-                for m in msgs:
-                    if not isinstance(m, AIMessage):
-                        continue
-                    if not streaming:
-                        reasoning, text = extract_chunk(m)
-                        self.printer.feed("reasoning", reasoning)
-                        self.printer.feed("text", text)
-                    if m.tool_calls:
-                        self.printer.end()
-                        if self.settings.cli.show_tool_calls:
-                            for tc in m.tool_calls:
-                                self.console.print(Text.assemble(
-                                    ("  ▶ ", "magenta"), (tc["name"], "bold magenta"), " ", (short(tc["args"]), "dim")))
-                        self.printer.wait("执行工具…")
-            elif node == "tools":
-                self.printer.end()
-                if self.settings.cli.show_tool_calls:
-                    for m in msgs:
-                        if isinstance(m, ToolMessage):
-                            ok = m.status != "error"
-                            self.console.print(Text.assemble(
-                                ("  ✓ " if ok else "  ✗ ", "green" if ok else "red"),
-                                (short(message_text(m) or str(m.content), 200), "dim")))
-                self.printer.wait()
+        u = ev.usage
+        if u is not None and self.settings.cli.show_usage and u.calls:
+            self.console.print(Text(format_usage_line(u, ev.elapsed), style="dim"))
 
     # ---------- 危险操作确认 ----------
     def _format_args(self, tool: str, args: dict):
@@ -410,11 +524,15 @@ class AgentCLI:
             return Group(Text(title, style="bold"), diff)
         return Text(clip_lines(json.dumps(args, ensure_ascii=False, indent=2, default=str)))
 
+    def approval_panel(self, value: dict) -> Panel:
+        """需要确认的操作详情：命令、要写入的内容或修改的 diff。"""
+        tool = value.get("tool", "?")
+        return Panel(self._format_args(tool, value.get("args") or {}),
+                     title=f"[bold yellow]需要确认：{escape(tool)}[/]", border_style="yellow")
+
     def _ask_approval(self, value: dict) -> tuple[dict, bool]:
         self.printer.end()
-        tool = value.get("tool", "?")
-        self.console.print(Panel(self._format_args(tool, value.get("args") or {}),
-                                 title=f"[bold yellow]需要确认：{escape(tool)}[/]", border_style="yellow"))
+        self.console.print(self.approval_panel(value))
         hint = "[yellow]是否允许？[/] y=允许  n=拒绝  a=本次运行始终允许该工具  其他内容=拒绝并反馈给助手 › "
         while True:
             ans = self.console.input(hint).strip()
@@ -544,21 +662,19 @@ class AgentCLI:
             self.console.print(f"[dim]……（省略前 {len(msgs) - limit} 条，/history 查看全部）[/]")
             msgs = msgs[-limit:]
         self.console.rule("[dim]会话记录[/]")
-        for m in msgs:
+        for i, m in enumerate(msgs):
             if isinstance(m, HumanMessage):
-                self.console.print(Text.assemble(("你 › ", "bold green"), message_text(m)))
+                if i:
+                    self.console.print()
+                self.console.print(Text.assemble(("› ", "bold cyan"), message_text(m)))
             elif isinstance(m, AIMessage):
                 _, text = extract_chunk(m)
                 if text.strip():
-                    self.console.print(Text(f"{self.settings.agent.name} ›", style="bold cyan"))
-                    self.console.print(Markdown(text.strip()))
+                    self.console.print(bullet(Markdown(text.strip())))
                 for tc in m.tool_calls:
-                    self.console.print(Text.assemble(("  ▶ ", "magenta"), (tc["name"], "magenta"), " ",
-                                                     (short(tc["args"]), "dim")))
+                    self.console.print(tool_call_text(tc))
             elif isinstance(m, ToolMessage):
-                ok = m.status != "error"
-                self.console.print(Text.assemble(("  ✓ " if ok else "  ✗ ", "green" if ok else "red"),
-                                                 (short(message_text(m) or str(m.content), 120), "dim")))
+                self.console.print(tool_result_text(m, 120))
         self.console.rule()
 
     def cmd_model(self, arg: str) -> None:
@@ -647,14 +763,19 @@ class AgentCLI:
         if not self.rt.approval.enabled:
             self.console.print("[yellow]注意：危险操作确认已关闭[/]")
 
+    def set_approval(self, enabled: bool) -> None:
+        """开关危险操作确认。开启时清掉“本次运行始终允许”。只能在两轮之间调用：同一轮内策略不能变（见 approval.py）。"""
+        self.rt.approval.enabled = enabled
+        if enabled:
+            self.rt.approval.session_allowed.clear()
+
     def cmd_approve(self, arg: str) -> None:
         a = arg.lower()
         if a in ("on", "开"):
-            self.rt.approval.enabled = True
-            self.rt.approval.session_allowed.clear()
+            self.set_approval(True)
             self.console.print("[green]已开启危险操作确认[/]")
         elif a in ("off", "关"):
-            self.rt.approval.enabled = False
+            self.set_approval(False)
             self.console.print("[yellow]已关闭危险操作确认，写文件和执行命令将不再询问，请谨慎！[/]")
         else:
             state = "开启" if self.rt.approval.enabled else "关闭"
