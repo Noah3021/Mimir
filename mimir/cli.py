@@ -5,11 +5,12 @@ import argparse
 import json
 import logging
 import sys
+from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
 from rich.console import Console, Group
 from rich.live import Live
@@ -325,9 +326,9 @@ class AgentCLI:
             ("class:hint", "  /help 查看命令 · Esc+Enter 换行 · Ctrl+C 中断回答"),
         ]
 
-    def last_call_usage(self) -> Usage | None:
-        """当前会话最近一次模型调用的用量（含缓存命中），还没调用过时为 None。"""
-        for m in reversed(self.rt.messages()):
+    def last_call_usage(self, messages: Sequence[BaseMessage] | None = None) -> Usage | None:
+        """当前会话最近一次模型调用的用量（含缓存命中），还没调用过时为 None。传入 messages 可免去重复读状态。"""
+        for m in reversed(self.rt.messages() if messages is None else messages):
             u = usage_of(m)
             if u is not None:
                 return u

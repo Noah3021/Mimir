@@ -46,7 +46,7 @@ from rich.text import Text
 
 from .cli import EXIT_WORDS, AgentCLI, stream_renderable
 from .turn import THINKING
-from .usage import Usage, fmt_tokens
+from .usage import Usage, fmt_tokens, summarize
 
 logger = logging.getLogger("mimir")
 
@@ -67,7 +67,9 @@ STYLE = Style.from_dict({
     "ctx-mid": "ansiyellow",
     "ctx-high": "ansired",
     "ctx-empty": "#444444",
-    "cache": "#5fafaf",
+    "cache-high": "#5fafaf",
+    "cache-mid": "#bcbcbc",
+    "cache-low": "ansiyellow",
     "approval-title": "bold ansiyellow",
     "choice": "#bcbcbc",
     "choice-selected": "bold #00afff",
@@ -101,15 +103,20 @@ def context_bar(usage: tuple[int, int] | None, width: int = 20) -> StyleAndTextT
     ]
 
 
-def cache_text(last: Usage | None) -> StyleAndTextTuples:
-    """最近一次模型调用的缓存命中：缓存 75% · 1.2k。还没调用过时为“缓存 —”。"""
-    if last is None or last.input <= 0:
+def cache_text(session: Usage | None) -> StyleAndTextTuples:
+    """整个会话累计的缓存命中：缓存 75% · 命中 1.2k。还没调用过时为“缓存 —”。
+
+    命中率 ≥60% 青色，30%~60% 浅灰，更低黄色。累计值比只看最后一次调用稳，不会在 0% 和高值之间跳。
+    """
+    if session is None or session.input <= 0:
         return [("class:dim", "缓存 —")]
-    return [("class:dim", "缓存 "), ("class:cache", f"{last.cache_rate:.0%}"),
-            ("class:dim", f" · {fmt_tokens(last.cache_read)}")]
+    rate = session.cache_rate
+    level = "high" if rate >= 0.6 else "mid" if rate >= 0.3 else "low"
+    return [("class:dim", "缓存 "), (f"class:cache-{level}", f"{rate:.0%}"),
+            ("class:dim", f" · 命中 {fmt_tokens(session.cache_read)}")]
 
 
-# 底部状态栏的数据：(审批是否开启, (上下文已用, 窗口), 最近一次调用的用量)
+# 底部状态栏的数据：(审批是否开启, (上下文已用, 窗口), 整个会话累计的用量)
 FooterState = tuple[bool, "tuple[int, int] | None", "Usage | None"]
 
 
@@ -484,11 +491,11 @@ class FixedInputUI:
 
     def _footer_fragments(self) -> StyleAndTextTuples:
         """底部一行，从左到右：审批状态 │ 上下文进度条 │ 缓存命中（│ 临时提示）。"""
-        enabled, usage, last = self.footer_state
+        enabled, usage, session = self.footer_state
         sep = ("class:rule", "  │  ")
         out: StyleAndTextTuples = [("class:approval", "  审批：开启")] if enabled \
             else [("class:approval-off", "  审批：关闭")]
-        out += [sep, *context_bar(usage), sep, *cache_text(last)]
+        out += [sep, *context_bar(usage), sep, *cache_text(session)]
         if self.hint:
             out += [sep, ("class:ctx-mid", self.hint)]
         return out
@@ -713,9 +720,10 @@ class FixedInputUI:
     def _footer_state(self) -> FooterState:
         """（后台线程）底部状态栏要显示的数据：读会话状态比较慢，只在每次处理完输入后算一次。"""
         try:
-            last = self.cli.last_call_usage()
-            usage = self.cli.context_usage(last)
+            msgs = self.cli.rt.messages()
+            usage = self.cli.context_usage(self.cli.last_call_usage(msgs))  # 上下文只看最后一次调用
+            session = summarize(msgs)  # 缓存看整个会话累计
         except Exception:
             logger.exception("计算上下文占用失败")
-            last = usage = None
-        return self.cli.rt.approval.enabled, usage, last
+            usage = session = None
+        return self.cli.rt.approval.enabled, usage, session

@@ -132,8 +132,25 @@ def plain(frags) -> str:
 def test_cache_text():
     assert plain(cache_text(None)) == "缓存 —"
     assert plain(cache_text(Usage(input=0))) == "缓存 —"
-    assert plain(cache_text(Usage(input=4000, cache_read=3000))) == "缓存 75% · 3.0k"
-    assert plain(cache_text(Usage(input=1600))) == "缓存 0% · 0"
+    assert plain(cache_text(Usage(input=4000, cache_read=3000))) == "缓存 75% · 命中 3.0k"
+    assert plain(cache_text(Usage(input=1600))) == "缓存 0% · 命中 0"
+
+
+def test_cache_text_levels():
+    """命中率 ≥60% 青色，30%~60% 浅灰，更低黄色。"""
+    assert cache_text(Usage(input=100, cache_read=60))[1][0] == "class:cache-high"
+    assert cache_text(Usage(input=100, cache_read=59))[1][0] == "class:cache-mid"
+    assert cache_text(Usage(input=100, cache_read=30))[1][0] == "class:cache-mid"
+    assert cache_text(Usage(input=100, cache_read=29))[1][0] == "class:cache-low"
+    assert cache_text(Usage(input=100))[1][0] == "class:cache-low"
+
+
+def test_cache_text_is_session_cumulative():
+    """会话累计：一次没命中不会把整体拉到 0%。"""
+    session = Usage()
+    for u in (Usage(input=4000, cache_read=3000), Usage(input=4000), Usage(input=4000, cache_read=3500)):
+        session.add(u)
+    assert plain(cache_text(session)) == "缓存 54% · 命中 6.5k"
 
 
 def test_footer_order(cli):
@@ -142,7 +159,7 @@ def test_footer_order(cli):
     ui.footer_state = (True, (16_000, 128_000), Usage(input=16_000, cache_read=12_000))
     text = plain(ui._footer_fragments())
     assert text.startswith("  审批：开启  │  上下文 ")
-    assert text.index("上下文") < text.index("缓存 75% · 12.0k")
+    assert text.index("上下文") < text.index("缓存 75% · 命中 12.0k")
     assert "   " not in text.split("│")[-1].strip()  # 末尾没有填充空格
     ui.footer_state = (False, None, None)
     assert plain(ui._footer_fragments()) == "  审批：关闭  │  上下文 —  │  缓存 —"
