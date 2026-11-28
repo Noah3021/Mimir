@@ -51,7 +51,7 @@ from .usage import Usage, fmt_tokens, summarize
 logger = logging.getLogger("mimir")
 
 SPINNER = "·✢✳✻✽✻✳✢"
-HINT = "/help 查看命令 · Esc+Enter 换行 · Esc 中断回答 · 连按两次 Ctrl+C 退出"
+HINT = "/help 查看命令 · Esc+Enter 换行 · Esc 中断回答 · Shift+Tab 开关审批 · 连按两次 Ctrl+C 退出"
 INTERRUPTING = "正在中断…（当前步骤结束后停止）"
 
 STYLE = Style.from_dict({
@@ -534,7 +534,7 @@ class FixedInputUI:
                 self.request_exit()
             else:
                 self._last_ctrl_c = now
-                self.hint, self.hint_until = "再按一次 Ctrl+C 退出", now + 2
+                self._set_hint("再按一次 Ctrl+C 退出", 2.0)
 
         @kb.add("c-d")
         def _(event):
@@ -558,7 +558,35 @@ class FixedInputUI:
             kb.add(key, filter=approving & empty, eager=True)(lambda event, idx=idx: self.choose(idx))
 
         kb.add("tab")(generate_completions)
+
+        @kb.add("s-tab")
+        def _(event):
+            if self.buffer.complete_state:  # 补全菜单打开时保持 prompt_toolkit 的默认行为：向后选
+                self.buffer.complete_previous()
+            else:
+                self.toggle_approval()
+
         return kb
+
+    def toggle_approval(self) -> None:
+        """（界面线程）Shift+Tab：开关危险操作确认。
+
+        同一轮对话内策略不能变（否则 interrupt 重放时顺序会错位），所以只在空闲时切换：
+        有回答在进行、有输入在排队、正在确认时，只提示不切换。
+        """
+        with self._cv:
+            busy = self._outstanding > 0
+        if busy or self.approval is not None:
+            self._set_hint("回答期间不能切换审批，等这一轮结束后再按 Shift+Tab")
+            return
+        enable = not self.cli.rt.approval.enabled
+        self.cli.set_approval(enable)
+        _, usage, session = self.footer_state
+        self.footer_state = (enable, usage, session)
+        self._set_hint("已开启危险操作确认" if enable else "已关闭危险操作确认，写文件和执行命令将不再询问")
+
+    def _set_hint(self, text: str, seconds: float = 3.0) -> None:
+        self.hint, self.hint_until = text, time.monotonic() + seconds
 
     def submit(self) -> None:
         line = self.buffer.text.strip()

@@ -763,14 +763,19 @@ class AgentCLI:
         if not self.rt.approval.enabled:
             self.console.print("[yellow]注意：危险操作确认已关闭[/]")
 
+    def set_approval(self, enabled: bool) -> None:
+        """开关危险操作确认。开启时清掉“本次运行始终允许”。只能在两轮之间调用：同一轮内策略不能变（见 approval.py）。"""
+        self.rt.approval.enabled = enabled
+        if enabled:
+            self.rt.approval.session_allowed.clear()
+
     def cmd_approve(self, arg: str) -> None:
         a = arg.lower()
         if a in ("on", "开"):
-            self.rt.approval.enabled = True
-            self.rt.approval.session_allowed.clear()
+            self.set_approval(True)
             self.console.print("[green]已开启危险操作确认[/]")
         elif a in ("off", "关"):
-            self.rt.approval.enabled = False
+            self.set_approval(False)
             self.console.print("[yellow]已关闭危险操作确认，写文件和执行命令将不再询问，请谨慎！[/]")
         else:
             state = "开启" if self.rt.approval.enabled else "关闭"

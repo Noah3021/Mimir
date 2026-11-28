@@ -221,6 +221,61 @@ def test_slash_command_runs_in_worker(cli):
     assert "已关闭危险操作确认" in text
 
 
+SHIFT_TAB = "\x1b[Z"
+
+
+def test_shift_tab_toggles_approval(cli):
+    """空闲时 Shift+Tab 开关审批，底部状态栏和提示同步变化；开启时清掉“始终允许”。"""
+    approval = cli.rt.approval
+    approval.allow("write_file")
+    seen = []
+
+    def press(ui, pipe):
+        pipe.send_text(SHIFT_TAB)
+        assert wait_for(lambda: ui.cli.rt.approval.enabled is not seen[-1])
+        seen.append(ui.cli.rt.approval.enabled)
+
+    def check_off(ui, pipe):
+        assert wait_for(lambda: ui.footer_state[0] is False)
+        assert "审批：关闭" in plain(ui._footer_fragments())
+        assert "已关闭危险操作确认" in ui.hint
+        assert "write_file" in approval.session_allowed  # 关闭时不动“始终允许”
+
+    def check_on(ui, pipe):
+        assert wait_for(lambda: ui.footer_state[0] is True)
+        assert "审批：开启" in plain(ui._footer_fragments())
+        assert "已开启危险操作确认" in ui.hint
+        assert not approval.session_allowed
+
+    seen.append(True)
+    drive(cli, press, check_off, press, check_on)
+    assert approval.enabled is True
+
+
+def test_shift_tab_refused_while_busy(cli, model):
+    """回答期间同一轮内策略不能变，Shift+Tab 只提示不切换。"""
+    started, gate = threading.Event(), threading.Event()
+
+    def slow(messages):
+        started.set()
+        gate.wait(10)
+        return "好了"
+
+    model.script = [slow]
+
+    def step(ui, pipe):
+        pipe.send_text("你好\r")
+        assert started.wait(10)
+        pipe.send_text(SHIFT_TAB)
+        assert wait_for(lambda: "回答期间不能切换审批" in ui.hint)
+        assert cli.rt.approval.enabled is True
+        gate.set()
+        assert ui.wait_idle(1)
+
+    drive(cli, step)
+    assert cli.rt.approval.enabled is True
+
+
 def test_escape_interrupts_turn(cli, model):
     started, gate = threading.Event(), threading.Event()
 
